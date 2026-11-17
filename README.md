@@ -18,6 +18,15 @@
 
 ### M2 单场景闭环（🚧 进行中）
 - [x] DeepSeek LLM 客户端接入与连通性测试
+- [x] 意图路由（11-17）：`app/llm.py`（OpenAI 兼容、BASE_URL 可切 Ollama、JSON Schema 校验 + 一次修复重试 + 降级）
+- [x] `app/prompts/router_v1.txt` + `app/agents/router.py` + `app/cli.py`
+- [x] 路由单测 6 条（合法 JSON / 非法 JSON 修复 / API 失败降级 / 空输入），pytest 15 passed
+- [x] T6：CLI 真实调用上报 Langfuse（`router_intent` → `router_llm` GENERATION），记录见 `docs/traces/11-17.md`
 - [ ] LangGraph 状态图骨架
 - [ ] 3 个草稿写工具（create_ticket_draft, draft_reply, handoff_human）
 - [ ] 破损漏液端到端测试
+
+### 明日待办（11-18）
+- [ ] LangGraph 状态定义（节点/边/路由分支）
+- [ ] 破损漏液单场景闭环
+- [ ] 3 个草稿写工具
