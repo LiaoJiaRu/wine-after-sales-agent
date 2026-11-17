@@ -1,0 +1,16 @@
+{
+  "shipments": [
+    {
+      "order_id": "SO20261116001",
+      "waybill_no": "SF1234567890",
+      "carrier": "SF",
+      "status": "delivered",
+      "signed_at": "2026-11-15T14:20:00+08:00",
+      "traces": [
+        {"time": "2026-11-14T09:00:00+08:00", "event": "揽收"},
+        {"time": "2026-11-15T14:20:00+08:00", "event": "已签收"}
+      ],
+      "abnormal": null
+    }
+  ]
+}

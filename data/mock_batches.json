@@ -1,0 +1,11 @@
+{
+  "batches": [
+    {
+      "batch_no": "B20261018-01",
+      "sku": "WL-MT-500",
+      "outbound_at": "2026-10-18T10:00:00+08:00",
+      "warehouse": "SZ-01",
+      "abnormal_count": 0
+    }
+  ]
+}

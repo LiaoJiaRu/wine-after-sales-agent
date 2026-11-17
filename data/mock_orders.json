@@ -1,0 +1,17 @@
+{
+  "orders": [
+    {
+      "order_id": "SO20261116001",
+      "user_id": "U1001",
+      "sku": "WL-MT-500",
+      "product_name": "某白酒 500ml",
+      "batch_no": "B20261018-01",
+      "quantity": 2,
+      "insured": true,
+      "insured_amount": 1200,
+      "order_amount": 1180,
+      "signed_at": "2026-11-15T14:20:00+08:00",
+      "status": "signed"
+    }
+  ]
+}
