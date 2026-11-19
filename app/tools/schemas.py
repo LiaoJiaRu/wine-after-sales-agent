@@ -106,3 +106,62 @@ class CompensationSuggestion(BaseModel):
 class CalcCompensationOutput(BaseModel):
     meta: ToolMeta
     suggestion: CompensationSuggestion
+
+# ---------- 草稿写工具（只产出草稿，不落库、不退款、不改订单） ----------
+
+class TicketToolResults(BaseModel):
+    """工单草稿的输入事实：订单必填，物流/证据/赔付建议可选。"""
+    order: OrderInfo
+    shipment: Optional[ShipmentInfo] = None
+    evidence: Optional[EvidenceStatus] = None
+    compensation: Optional[CompensationSuggestion] = None
+
+class CreateTicketDraftInput(BaseModel):
+    order_id: str
+    issue_type: IssueType
+    tool_results: TicketToolResults
+
+class TicketDraft(BaseModel):
+    draft_id: str
+    order_id: str
+    issue_type: str
+    summary: str
+    evidence_status: EvidenceStatus
+    compensation: CompensationSuggestion
+    policy_clauses: list[str] = Field(default_factory=list)
+    need_human_review: bool = True
+    status: Literal["draft"] = "draft"
+    created_at: datetime
+
+class CreateTicketDraftOutput(BaseModel):
+    meta: ToolMeta
+    draft: TicketDraft
+
+class ReplyFacts(BaseModel):
+    """回复草稿的输入事实；允许为空，空事实时输出通用话术。"""
+    product_name: str = ""
+    evidence_complete: bool = True
+    evidence_missing: list[str] = Field(default_factory=list)
+    recommendation: Optional[Literal["partial_refund", "reship", "supplement_evidence", "handoff_human"]] = None
+    amount: float = 0.0
+    reason: str = ""
+
+class DraftReplyInput(BaseModel):
+    order_id: str
+    issue_type: IssueType
+    facts: ReplyFacts = Field(default_factory=ReplyFacts)
+
+class ReplyDraft(BaseModel):
+    draft_id: str
+    order_id: str
+    issue_type: str
+    tone: Literal["gentle"] = "gentle"
+    content: str
+    checklist: list[str] = Field(default_factory=list)
+    storage_advice: list[str] = Field(default_factory=list)
+    status: Literal["draft"] = "draft"
+    created_at: datetime
+
+class DraftReplyOutput(BaseModel):
+    meta: ToolMeta
+    reply: ReplyDraft
