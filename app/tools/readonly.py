@@ -11,6 +11,10 @@ REQUIRED_EVIDENCE = {
     "wrong_item": ["开箱视频", "面单照片", "商品照片"],
 }
 
+# 酒知识咨询关键词：命中即优先命中 P-KNOW 系列（权重高于理赔条款）
+KNOWLEDGE_KEYWORDS = ("保存", "存放", "储存", "饮用", "开瓶", "怎么喝", "醒酒", "口感")
+KNOWLEDGE_PREFIX = "P-KNOW"
+
 def _meta(tool: str, t0: float, ok: bool = True) -> ToolMeta:
     return ToolMeta(tool=tool, ok=ok, elapsed_ms=int((time.perf_counter() - t0) * 1000))
 
@@ -36,16 +40,24 @@ def get_batch(batch_no: str) -> GetBatchOutput:
     raise NotFoundError(f"批次不存在: {batch_no}")
 
 def search_policy(query: str, top_k: int = 3) -> SearchPolicyOutput:
+    """字符重合度检索；query 命中酒知识关键词时，P-KNOW 系列整体上浮到理赔条款之前。
+
+    排序键：(知识优先, 字符得分降序, 政策编号升序)。
+    非知识咨询的查询（如“破损漏液”）priority 恒为 0，排序与旧实现完全一致。
+    """
     t0 = time.perf_counter()
     q = set(query.strip().lower())
-    scored: list[tuple[int, dict]] = []
+    prefer_knowledge = any(k in query for k in KNOWLEDGE_KEYWORDS)
+    scored: list[tuple[int, int, dict]] = []
     for p in load_policies():
         text = f"{p['title']} {p['content']}".lower()
         score = sum(1 for ch in q if ch in text)
-        if score > 0:
-            scored.append((score, p))
-    scored.sort(key=lambda x: (-x[0], x[1]["id"]))
-    hits = [PolicyHit(score=float(s), **p) for s, p in scored[:top_k]]
+        if score == 0:
+            continue
+        priority = 1 if (prefer_knowledge and p["id"].startswith(KNOWLEDGE_PREFIX)) else 0
+        scored.append((priority, score, p))
+    scored.sort(key=lambda x: (-x[0], -x[1], x[2]["id"]))
+    hits = [PolicyHit(score=float(s), **p) for _, s, p in scored[:top_k]]
     return SearchPolicyOutput(meta=_meta("search_policy", t0), hits=hits)
 
 def check_evidence(order_id: str, issue_type: str, evidence: list[str]) -> CheckEvidenceOutput:

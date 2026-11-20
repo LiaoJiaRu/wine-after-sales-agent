@@ -20,6 +20,7 @@ from typing_extensions import TypedDict
 from app.agents.router import route as classify_intent
 from app.tools.errors import DataSourceError, NotFoundError, ToolError
 from app.tools.readonly import (
+    KNOWLEDGE_KEYWORDS,
     calc_compensation,
     check_evidence as _check_evidence,
     get_batch,
@@ -67,6 +68,7 @@ class GraphState(TypedDict, total=False):
     evidence: list[str]        # 调用方可在 invoke 输入里直接塞证据列表（E2E/单元测试路径）
     ticket_draft: dict[str, Any] | None
     reply_draft: dict[str, Any] | None
+    knowledge_result: str        # knowledge_agent 写回的酒知识说明（M3 新增）
     error: dict[str, Any]
     needs_human: bool            # CLI 层的 needs_human 标志（graph.handoff 与 needs_human 含义相同，双写便于 CLI 直接取）
 
@@ -86,6 +88,7 @@ DEFAULT_EMPTY: GraphState = {
     "batch": {},
     "ticket_draft": None,
     "reply_draft": None,
+    "knowledge_result": "",
     "error": {},
     "needs_human": False,
 }
@@ -118,8 +121,18 @@ def _derive_issue_type(sub_tasks: list[str]) -> str:
     return "broken_leak"
 
 
-# 合规守卫关键词：强退款诉求（资金操作）一律转人工，不走自动赔付/草稿流程。
-_REFUND_KEYWORDS = ("直接退款", "直接退钱", "立即退款", "立刻退款", "马上退款", "马上退钱")
+# 合规守卫关键词：只要出现退款/退钱诉求（资金操作）一律转人工，
+# 优先级高于意图路由与知识检索——命中即截断整条链路，不做赔付、不出草稿、不解答知识。
+_REFUND_KEYWORDS = (
+    "退款",
+    "退钱",
+    "直接退款",
+    "直接退钱",
+    "立即退款",
+    "立刻退款",
+    "马上退款",
+    "马上退钱",
+)
 
 
 def load_session(state: GraphState) -> dict[str, Any]:
@@ -146,8 +159,9 @@ def load_session(state: GraphState) -> dict[str, Any]:
 def router(state: GraphState) -> dict[str, Any]:
     """复用现有 route()。同时把 needs_human 同步到 State.needs_human，便于 CLI 层直接取。
 
-    合规守卫（先于 LLM）：用户要求"直接退款"类强资金诉求时，不进入自动流程，
+    合规守卫（先于 LLM、先于任何分流）：用户要求"直接退款"类强资金诉求时，不进入自动流程，
     直接置 handoff/needs_human=True（error.code=COMPLIANCE_REFUND），由条件边转 handoff_human。
+    该判定排在知识分流之前，因此"退款 + 酒知识"混装诉求只会转人工，不会解答知识。
     草稿工具本身只生成草稿、不退款，这里是第一道拦截。
     """
     text = state.get("user_text", "") or state.get("text", "") or ""
@@ -233,8 +247,31 @@ def check_evidence(state: GraphState) -> dict[str, Any]:
     }
 
 
+def _merge_knowledge_into_reply(state: GraphState, reply_dict: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    """多意图合并：理赔诉求 + 知识诉求时，把 P-KNOW 前 2 条追加到回复草稿末尾。
+
+    只读 State.user_text / sub_tasks 判定是否含知识诉求词；不含则原样返回，
+    保证纯理赔文本的回复内容与合并前完全一致。返回 (reply_dict, knowledge_text)。
+    """
+    text = f"{state.get('user_text') or ''} {' '.join(state.get('sub_tasks') or [])}"
+    if not any(k in text for k in KNOWLEDGE_KEYWORDS):
+        return reply_dict, ""
+
+    knowledge = knowledge_agent(state).get("knowledge_result", "")
+    if not knowledge or knowledge == KNOWLEDGE_QUERY_FALLBACK:
+        return reply_dict, ""
+
+    items = [line for line in knowledge.split("\n") if line.strip()]
+    block = "【酒知识解答】\n" + "\n".join(f"{i}. {line}" for i, line in enumerate(items, 1))
+    reply_dict["content"] = reply_dict["content"].rstrip() + "\n\n" + block
+    return reply_dict, knowledge
+
+
 def create_draft(state: GraphState) -> dict[str, Any]:
-    """生成工单草稿 + 回复草稿。任何异常 → handoff/needs_human=True。"""
+    """生成工单草稿 + 回复草稿。任何异常 → handoff/needs_human=True。
+
+    多意图（理赔 + 酒知识）时：工单逻辑不变，仅把知识条目追加到回复话术末尾。
+    """
     order_id = state.get("order_id", "")
     issue_type = state.get("issue_type") or _derive_issue_type(state.get("sub_tasks", []))
     try:
@@ -253,9 +290,11 @@ def create_draft(state: GraphState) -> dict[str, Any]:
                 "amount": comp.get("amount", 0.0),
             },
         )
+        reply_dict, knowledge = _merge_knowledge_into_reply(state, reply.reply.model_dump())
         return {
             "ticket_draft": ticket.draft.model_dump(),
-            "reply_draft": reply.reply.model_dump(),
+            "reply_draft": reply_dict,
+            "knowledge_result": knowledge,
             "handoff": False,
             "needs_human": False,
         }
@@ -266,6 +305,32 @@ def create_draft(state: GraphState) -> dict[str, Any]:
         }
     except Exception as exc:  # pragma: no cover - 兜底
         return {"handoff": True, "needs_human": True, "error": {"code": "INTERNAL", "message": str(exc)}}
+
+
+KNOWLEDGE_QUERY_FALLBACK = "关于该问题我暂时没有找到相关说明"
+_KNOWLEDGE_INTENTS = {"储存饮用咨询"}
+
+
+def knowledge_agent(state: GraphState) -> dict[str, Any]:
+    """酒知识专业子 Agent 节点（M3）。
+
+    读取 user_text（回退 sub_tasks）→ search_policy → 取 P-KNOW 前 2 条拼成一段说明，
+    写入 State.knowledge_result；检索不到或异常时写兜底话术，不 handoff、不影响主链。
+    """
+    query = (state.get("user_text") or "").strip()
+    if not query:
+        query = " ".join(state.get("sub_tasks") or [])
+
+    try:
+        hits = [h for h in search_policy(query, top_k=3).hits if h.id.startswith("P-KNOW")][:2]
+    except Exception:  # 知识检索失败不阻断对话，直接兜底
+        hits = []
+
+    if not hits:
+        return {"knowledge_result": KNOWLEDGE_QUERY_FALLBACK}
+
+    text = "\n".join(f"{h.title}：{h.content}" for h in hits)
+    return {"knowledge_result": text}
 
 
 def handoff_human(state: GraphState) -> dict[str, Any]:
@@ -299,7 +364,12 @@ def _route_after_fetch(state: GraphState) -> str:
 
 def _route_after_router(state: GraphState) -> str:
     # router 里 needs_human=True 也走 handoff（空输入、路由降级、非法 intent）
-    return "handoff_human" if state.get("handoff") else "fetch_evidence"
+    if state.get("handoff"):
+        return "handoff_human"
+    # 酒知识咨询走专业子 Agent：只按 intent 判定，避免“漏了…怎么保存”这类理赔文本被误分流
+    if state.get("intent") in _KNOWLEDGE_INTENTS or "储存饮用咨询" in (state.get("sub_tasks") or []):
+        return "knowledge_agent"
+    return "fetch_evidence"
 
 
 def _route_after_load(state: GraphState) -> str:
@@ -321,6 +391,7 @@ def compile_graph():
     sg.add_node("fetch_evidence", fetch_evidence)
     sg.add_node("check_evidence", check_evidence)
     sg.add_node("create_draft", create_draft)
+    sg.add_node("knowledge_agent", knowledge_agent)
     sg.add_node("handoff_human", handoff_human)
 
     # load_session 后加条件边：空 order_id 直接 handoff_human（不进 router，避免同 step 两次写 handoff）
@@ -330,6 +401,7 @@ def compile_graph():
     sg.add_conditional_edges("fetch_evidence", _route_after_fetch)
     sg.add_edge("check_evidence", "create_draft")
     sg.add_edge("create_draft", END)
+    sg.add_edge("knowledge_agent", END)
     sg.add_edge("handoff_human", END)
 
     return sg.compile()
