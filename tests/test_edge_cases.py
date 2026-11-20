@@ -7,18 +7,55 @@
                                          但 ticket_draft.need_human_review=True + 回复含补证清单
   4. 数据源异常（DataSourceError）      → fetch_evidence 内部捕获，handoff_human
   5. 空用户输入                        → router 降级 needs_human，handoff_human
+  6. 赔付边界                          → calc_compensation 超 7 天时效转人工、保价封顶截断
 
 所有用例共同断言：invoke 不抛任何未处理异常（pytest 通过即证明），State 字段自洽。
 """
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
 from app.graph import compile_graph
+import app.tools.readonly as ro
 from app.tools.errors import DataSourceError
+from app.tools.schemas import GetOrderOutput, OrderInfo, ToolMeta
 
 ORDER_ID = "SO20261116001"
 USER_TEXT_BROKEN = "我买的酒漏了，瓶身有破损"
+
+TZ = timezone(timedelta(hours=8))
+
+
+def _mock_order(monkeypatch, **overrides) -> OrderInfo:
+    """把 readonly.get_order 替换为返回指定订单的假实现。
+
+    calc_compensation 内部引用的是模块级全局名 get_order，
+    因此 patch app.tools.readonly.get_order 即可命中，无需真实数据文件。
+    默认签收时间为「当前时间回推 2 天」，确保用例不随运行日期漂移。
+    """
+    base = dict(
+        order_id=ORDER_ID,
+        user_id="U1001",
+        sku="WL-MT-500",
+        product_name="某白酒 500ml",
+        batch_no="B20261018-01",
+        quantity=2,
+        insured=True,
+        insured_amount=1200.0,
+        order_amount=1180.0,
+        signed_at=datetime.now(TZ) - timedelta(days=2),
+        status="signed",
+    )
+    base.update(overrides)
+    order = OrderInfo(**base)
+    monkeypatch.setattr(
+        ro,
+        "get_order",
+        lambda _order_id: GetOrderOutput(meta=ToolMeta(tool="get_order"), order=order),
+    )
+    return order
 
 GR = compile_graph()
 
@@ -172,3 +209,35 @@ def test_empty_user_text_handoffs():
     assert state["needs_human"] is True
     assert state["error"]["code"] == "EMPTY_INPUT"
     assert state.get("ticket_draft") is None
+
+
+# ---------------------------------------------------------------------------
+# 6. calc_compensation 赔付边界：超时效转人工 / 保价封顶截断
+# ---------------------------------------------------------------------------
+
+
+def test_calc_compensation_over_time_handoffs(monkeypatch):
+    """签收超过 7 天 → handoff_human（P-TIME-001），不做自动赔付。
+
+    signed_at 取「当前时间回推 10 天」，等价于作业建议的 11-01 场景，
+    但不随运行日期漂移（固定日期在远期运行时可能不足 7 天而失效）。
+    """
+    _mock_order(monkeypatch, signed_at=datetime.now(TZ) - timedelta(days=10))
+
+    sug = ro.calc_compensation(ORDER_ID, "broken_leak", True).suggestion
+
+    assert sug.recommendation == "handoff_human"
+    assert "超 7 天时效" in sug.reason
+    assert sug.amount == 0.0
+    assert sug.policy_ids == ["P-TIME-001"]
+
+
+def test_calc_compensation_insured_cap_truncates(monkeypatch):
+    """保价封顶截断：订单 5000 × 30% = 1500，保价 1000 → amount 截断为 1000。"""
+    _mock_order(monkeypatch, order_amount=5000.0, insured=True, insured_amount=1000.0)
+
+    sug = ro.calc_compensation(ORDER_ID, "broken_leak", True).suggestion
+
+    assert sug.recommendation == "partial_refund"
+    assert sug.amount == pytest.approx(1000.0), f"应按保价封顶为 1000，实际 {sug.amount}"
+    assert sug.amount != pytest.approx(1500.0)
