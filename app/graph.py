@@ -36,6 +36,19 @@ from app.tools.write import create_ticket_draft, draft_reply
 # ---------------------------------------------------------------------------
 
 
+class SubTaskState(TypedDict, total=False):
+    """多意图子任务对象（M3 补齐阶段1）。
+
+    task_type: 子任务类型，沿用 router.sub_tasks 的中文串（如"破损漏液"/"少件错发"/"储存饮用咨询"）
+    status:    pending / success / failed
+    result:    该子任务的取证结果（理赔类为订单/物流/批次/证据/赔付/政策；知识类为 knowledge_result）
+    """
+
+    task_type: str
+    status: str
+    result: dict[str, Any] | None
+
+
 class GraphState(TypedDict, total=False):
     """LangGraph 全局状态（Typeddict 风格，所有字段可选）。
 
@@ -69,6 +82,7 @@ class GraphState(TypedDict, total=False):
     ticket_draft: dict[str, Any] | None
     reply_draft: dict[str, Any] | None
     knowledge_result: str        # knowledge_agent 写回的酒知识说明（M3 新增）
+    task_outputs: list[SubTaskState]  # 多意图子任务对象列表（M3 补齐阶段1，intent=多意图 时由 router 生成）
     error: dict[str, Any]
     needs_human: bool            # CLI 层的 needs_human 标志（graph.handoff 与 needs_human 含义相同，双写便于 CLI 直接取）
 
@@ -89,6 +103,7 @@ DEFAULT_EMPTY: GraphState = {
     "ticket_draft": None,
     "reply_draft": None,
     "knowledge_result": "",
+    "task_outputs": [],
     "error": {},
     "needs_human": False,
 }
@@ -156,6 +171,22 @@ def load_session(state: GraphState) -> dict[str, Any]:
     return {"order_id": order_id, **common_fills}
 
 
+def _build_task_outputs(intent: str, sub_tasks: list[str]) -> list[SubTaskState]:
+    """intent=多意图 时把 sub_tasks 字符串升级为任务对象列表（初始全部 pending）。
+
+    非多意图返回空列表 —— 老的单意图链路完全不受影响（向后兼容）。
+    """
+    if intent != "多意图":
+        return []
+    outputs: list[SubTaskState] = []
+    for raw in sub_tasks:
+        name = (raw or "").strip()
+        if not name:
+            continue
+        outputs.append({"task_type": name, "status": "pending", "result": None})
+    return outputs
+
+
 def router(state: GraphState) -> dict[str, Any]:
     """复用现有 route()。同时把 needs_human 同步到 State.needs_human，便于 CLI 层直接取。
 
@@ -180,9 +211,11 @@ def router(state: GraphState) -> dict[str, Any]:
         }
     decision = classify_intent(text)
     handoff = bool(decision.needs_human)
+    sub_tasks = decision.sub_tasks or []
     return {
         "intent": decision.intent,
-        "sub_tasks": decision.sub_tasks or [],
+        "sub_tasks": sub_tasks,
+        "task_outputs": _build_task_outputs(decision.intent, sub_tasks),
         "handoff": handoff,
         "needs_human": handoff,
         "error": decision.error or {},
@@ -190,45 +223,125 @@ def router(state: GraphState) -> dict[str, Any]:
     }
 
 
-def fetch_evidence(state: GraphState) -> dict[str, Any]:
-    """串行拉取订单 + 物流 + 批次 + 证据核验 + 赔付建议 + 政策检索，写回 State.tool_results。
+def _is_knowledge_task(task_type: str) -> bool:
+    """判断子任务是否属于酒知识类（走 knowledge_agent，而不是理赔取证）。"""
+    name = (task_type or "").strip()
+    return name in {"储存饮用咨询", "酒知识", "知识咨询"} or any(k in name for k in KNOWLEDGE_KEYWORDS)
 
-    Data 层异常统一捕获 → 置 handoff/needs_human=True + 落 State.error，条件边会转 handoff_human。
-    issue_type 由 router.sub_tasks 推导（最小 ReAct），用户也可直接在 State 里显式传 issue_type 覆盖。
+
+def _fetch_claim(
+    order_id: str, issue_type: str, provided_evidence: list[str], query: str
+) -> dict[str, Any]:
+    """单个理赔子任务的取证：订单 + 物流 + 批次 + 证据核验 + 赔付建议 + 政策检索。
+
+    异常直接向上抛，由调用方统一降级为 handoff（与 M2 行为一致）。
     """
-    order_id = state["order_id"]  # load_session 已保证存在
-    issue_type = state.get("issue_type") or _derive_issue_type(state.get("sub_tasks", []))
-    # 允许调用方通过 State.evidence 直接传证据列表（M2 单元测试路径）
-    provided_evidence = state.get("evidence", []) or []
-
-    try:
-        order = get_order(order_id).order
-        shipment = get_logistics(order_id).shipment
-        batch = get_batch(order.batch_no).batch
-        evidence = _check_evidence(order_id, issue_type, provided_evidence)
-        compensation = calc_compensation(order_id, issue_type, evidence.status.complete)
-        search = search_policy(" ".join(state.get("sub_tasks", [])) or issue_type)
-    except (NotFoundError, DataSourceError, ToolError) as exc:
-        err = {"code": getattr(exc, "code", "TOOL_ERROR"), "message": getattr(exc, "message", str(exc))}
-        return {"handoff": True, "needs_human": True, "error": err, "issue_type": issue_type}
-
-    results = {
+    order = get_order(order_id).order
+    shipment = get_logistics(order_id).shipment
+    batch = get_batch(order.batch_no).batch
+    evidence = _check_evidence(order_id, issue_type, provided_evidence)
+    compensation = calc_compensation(order_id, issue_type, evidence.status.complete)
+    search = search_policy(query or issue_type)
+    return {
         "order": order.model_dump(),
         "shipment": shipment.model_dump(),
         "batch": batch.model_dump(),
         "evidence": evidence.status.model_dump(),
         "compensation": compensation.suggestion.model_dump(),
         "policy_hits": [h.model_dump() for h in search.hits],
-        "sub_tasks": state.get("sub_tasks", []),
         "issue_type": issue_type,
     }
+
+
+def fetch_evidence(state: GraphState) -> dict[str, Any]:
+    """按任务取证：多意图时遍历 task_outputs 逐个执行，单意图保持原串行行为。
+
+    - 理赔类子任务（破损/少件/错发）：各自调用 _fetch_claim，结果写入该任务的 result，status=success；
+      任一理赔任务抛 NotFound/DataSource/ToolError → 该任务 status=failed 并整体转 handoff（同 M2 语义）。
+    - 知识类子任务：调用 knowledge_agent 写 result={"knowledge_result": ...}。
+    - 兼容：tool_results 仍取「第一个理赔任务」的结果，字段结构不变，下游 create_draft 无需改动；
+      单意图（task_outputs 为空）走原逻辑，search_policy 的查询串与取值口径完全一致。
+    """
+    order_id = state["order_id"]  # load_session 已保证存在
+    sub_tasks = state.get("sub_tasks", []) or []
+    provided_evidence = state.get("evidence", []) or []
+    query = " ".join(sub_tasks)
+    tasks = state.get("task_outputs") or []
+    claim_tasks = [t for t in tasks if _ISSUE_MAP.get((t.get("task_type") or "").strip())]
+
+    # —— 兼容路径：单意图，或 task_outputs 为空/无理赔任务 ——
+    if not claim_tasks:
+        issue_type = state.get("issue_type") or _derive_issue_type(sub_tasks)
+        try:
+            results = _fetch_claim(order_id, issue_type, provided_evidence, query)
+        except (NotFoundError, DataSourceError, ToolError) as exc:
+            err = {"code": getattr(exc, "code", "TOOL_ERROR"), "message": getattr(exc, "message", str(exc))}
+            return {"handoff": True, "needs_human": True, "error": err, "issue_type": issue_type}
+
+        results["sub_tasks"] = sub_tasks
+        return {
+            "order": results["order"],
+            "shipment": results["shipment"],
+            "batch": results["batch"],
+            "evidence_status": results["evidence"],
+            "tool_results": results,
+            "issue_type": issue_type,
+        }
+
+    # —— 多意图路径：逐个子任务执行 ——
+    updated: list[SubTaskState] = []
+    primary: dict[str, Any] | None = None
+    primary_issue = ""
+    first_error: dict[str, Any] | None = None
+
+    for task in tasks:
+        item: SubTaskState = {
+            "task_type": task.get("task_type", ""),
+            "status": task.get("status", "pending"),
+            "result": task.get("result"),
+        }
+        name = (item["task_type"] or "").strip()
+        mapped = _ISSUE_MAP.get(name)
+
+        if mapped:
+            try:
+                payload = _fetch_claim(order_id, mapped, provided_evidence, query)
+            except (NotFoundError, DataSourceError, ToolError) as exc:
+                err = {"code": getattr(exc, "code", "TOOL_ERROR"), "message": getattr(exc, "message", str(exc))}
+                item["status"] = "failed"
+                item["result"] = {"error": err}
+                first_error = first_error or err
+                updated.append(item)
+                continue
+            item["status"] = "success"
+            item["result"] = payload
+            if primary is None:
+                primary, primary_issue = payload, mapped
+        elif _is_knowledge_task(name):
+            knowledge = knowledge_agent(state).get("knowledge_result", "")
+            item["result"] = {"knowledge_result": knowledge}
+            item["status"] = "success" if knowledge and knowledge != KNOWLEDGE_QUERY_FALLBACK else "failed"
+        updated.append(item)
+
+    if first_error is not None:
+        return {
+            "task_outputs": updated,
+            "handoff": True,
+            "needs_human": True,
+            "error": first_error,
+            "issue_type": primary_issue or state.get("issue_type", ""),
+        }
+
+    assert primary is not None  # claim_tasks 非空，循环内至少成功一次
+    primary["sub_tasks"] = sub_tasks
     return {
-        "order": results["order"],
-        "shipment": results["shipment"],
-        "batch": results["batch"],
-        "evidence_status": results["evidence"],
-        "tool_results": results,
-        "issue_type": issue_type,
+        "task_outputs": updated,
+        "order": primary["order"],
+        "shipment": primary["shipment"],
+        "batch": primary["batch"],
+        "evidence_status": primary["evidence"],
+        "tool_results": primary,
+        "issue_type": primary_issue,
     }
 
 
@@ -267,16 +380,71 @@ def _merge_knowledge_into_reply(state: GraphState, reply_dict: dict[str, Any]) -
     return reply_dict, knowledge
 
 
+_ISSUE_LABELS = {
+    "broken_leak": "破损漏液",
+    "missing_item": "少件",
+    "wrong_item": "错发",
+}
+
+
+def _claim_payloads(state: GraphState) -> list[tuple[str, dict[str, Any]]]:
+    """取出所有成功的理赔子任务结论（知识类任务没有 evidence/compensation，自动排除）。"""
+    out: list[tuple[str, dict[str, Any]]] = []
+    for task in state.get("task_outputs") or []:
+        if (task.get("status") or "") != "success":
+            continue
+        payload = task.get("result") or {}
+        if not payload.get("evidence") or not payload.get("compensation"):
+            continue
+        out.append(((payload.get("issue_type") or "").strip(), payload))
+    return out
+
+
+def _secondary_claim_suffix(payloads: list[tuple[str, dict[str, Any]]]) -> str:
+    """把次要理赔任务写进工单 summary 文本（不改 schema，只拼 summary 串）。"""
+    extras = [it for it, _ in payloads[1:] if it]
+    if not extras:
+        return ""
+    parts = [f"另发现{_ISSUE_LABELS.get(it, it)}问题，建议一并处理" for it in extras]
+    return "；" + "；".join(parts)
+
+
+def _merged_evidence(state: GraphState, payloads: list[tuple[str, dict[str, Any]]]) -> dict[str, Any]:
+    """多理赔任务时合并证据状态：missing 去重保序，全部齐全才算齐全。"""
+    if len(payloads) <= 1:
+        return state.get("evidence_status", {}) or {}
+    missing: list[str] = []
+    complete = True
+    for _, payload in payloads:
+        ev = payload.get("evidence") or {}
+        complete = complete and bool(ev.get("complete"))
+        for item in ev.get("missing") or []:
+            if item not in missing:
+                missing.append(item)
+    return {"complete": complete, "missing": missing}
+
+
 def create_draft(state: GraphState) -> dict[str, Any]:
     """生成工单草稿 + 回复草稿。任何异常 → handoff/needs_human=True。
 
-    多意图（理赔 + 酒知识）时：工单逻辑不变，仅把知识条目追加到回复话术末尾。
+    - 工单：入参仍按"主诉"（tool_results / issue_type），多理赔任务只在 summary 末尾追加
+      "另发现少件问题，建议一并处理"，不触碰 TicketDraft schema。
+    - 回复：多个理赔任务的补证清单合并去重后统一列出。
+    - 多意图（理赔 + 酒知识）时再把知识条目追加到回复末尾。
     """
     order_id = state.get("order_id", "")
     issue_type = state.get("issue_type") or _derive_issue_type(state.get("sub_tasks", []))
     try:
+        payloads = _claim_payloads(state)
         ticket = create_ticket_draft(order_id, issue_type, tool_results=state.get("tool_results", {}))
-        ev_status = state.get("evidence_status", {}) or {}
+        suffix = _secondary_claim_suffix(payloads)
+        ticket_draft = (
+            ticket.draft.model_copy(update={"summary": ticket.draft.summary + suffix})
+            if suffix
+            else ticket.draft
+        )
+
+        ev_status = _merged_evidence(state, payloads)
         comp = state.get("tool_results", {}).get("compensation") or {}
         order_dict = state.get("order") or {}
         reply = draft_reply(
@@ -292,7 +460,7 @@ def create_draft(state: GraphState) -> dict[str, Any]:
         )
         reply_dict, knowledge = _merge_knowledge_into_reply(state, reply.reply.model_dump())
         return {
-            "ticket_draft": ticket.draft.model_dump(),
+            "ticket_draft": ticket_draft.model_dump(),
             "reply_draft": reply_dict,
             "knowledge_result": knowledge,
             "handoff": False,
@@ -367,7 +535,11 @@ def _route_after_router(state: GraphState) -> str:
     if state.get("handoff"):
         return "handoff_human"
     # 酒知识咨询走专业子 Agent：只按 intent 判定，避免“漏了…怎么保存”这类理赔文本被误分流
-    if state.get("intent") in _KNOWLEDGE_INTENTS or "储存饮用咨询" in (state.get("sub_tasks") or []):
+    intent = state.get("intent")
+    if intent in _KNOWLEDGE_INTENTS:
+        return "knowledge_agent"
+    # 兼容：intent 判成"其他"但子任务只有知识咨询；多意图必须走取证主链（task_outputs 逐任务执行）
+    if intent != "多意图" and "储存饮用咨询" in (state.get("sub_tasks") or []):
         return "knowledge_agent"
     return "fetch_evidence"
 

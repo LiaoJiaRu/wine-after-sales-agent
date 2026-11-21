@@ -105,3 +105,56 @@
 - M4：规则校验 `rule_validate` + LLM Judge，把 11-19 的关键词合规判断并入统一规则层。
 - `handoff_human` 审批写队列按基线 11-20 落地（当前节点只置标，不写队列）。
 - 图内 Langfuse span 覆盖到 `knowledge_agent` / `create_draft`（M5）。
+
+---
+
+# 补记：M3 多意图彻底闭环（11-21）
+
+> 前七节的测试数字为 11-19 当日快照（70 条）。本节记录随后完成的「多意图拆解与合并」补齐，口径以本节为准。
+
+## 一、补齐内容
+
+| 阶段 | 内容 | 关键实现 |
+| --- | --- | --- |
+| 阶段1 任务对象化 | `sub_tasks`（字符串）→ `task_outputs`（任务对象） | 新增 `SubTaskState(task_type/status/result)`；`GraphState` 增 `task_outputs`；`router` 在 `intent=多意图` 时生成 pending 任务；`fetch_evidence` 逐任务执行，各自写 `result` |
+| 阶段2 结果合并 | 多理赔任务 → 一张工单 + 一段回复 | `_fetch_claim()` 单任务取证；工单入参仍取主诉，次要任务用 `model_copy` 追加 summary 文本（不改 schema）；`_merged_evidence()` 合并去重缺证清单 |
+| 阶段3 边界与异常 | 并行隔离性 | 单任务失败只标记该任务 `failed`；知识任务不受理赔失败影响；任一理赔失败仍整体 handoff |
+
+## 二、补齐期间修掉的两个真实缺陷
+
+1. **路由劫持**：`_route_after_router` 原第二条件“sub_tasks 含储存饮用咨询→知识节点”会把 `intent=多意图` 整条链路劫持到 `knowledge_agent`，取证完全不执行（连 `issue_type` 都不存在）。已改为多意图一律走取证主链，知识子任务在 `fetch_evidence` 内部按任务处理，由 `test_m3_subtasks.py` 锁定。
+2. **半成品工单风险**：若次要理赔任务失败而主诉成功，原逻辑会继续产出只有单诉求的工单。现在任一理赔子任务失败即整体 `handoff`，避免不完整工单流出。
+
+## 三、测试分布（11-21 实测）
+
+| 测试文件 | 条数 | 说明 |
+| --- | --- | --- |
+| tests/test_readonly_tools.py | 9 | 6 只读工具（含赔付边界） |
+| tests/test_router.py | 6 | 路由 + 降级 |
+| tests/test_draft_tools.py | 8 | 2 草稿写工具 |
+| tests/test_graph_basics.py | 5 | 图骨架 + handoff |
+| tests/test_e2e_m2.py | 13 | 两幕 E2E + CLI --graph |
+| tests/test_edge_cases.py | 14 | 边界、合规、赔付边界 |
+| tests/test_m3_knowledge.py | 8 | 知识检索 + knowledge_agent |
+| tests/test_m3_multi_intent.py | 7 | 多意图合并 + 合规优先 |
+| tests/test_m3_subtasks.py | 6 | 任务对象化与兼容 |
+| tests/test_m3_merge.py | 5 | 工单/回复多结果合并 |
+| tests/test_m3_edge.py | 4 | 并行隔离与异常边界 |
+| **合计** | **85** | `pytest -q` → 85 passed, 1 warning in 12.33s |
+
+## 四、多意图链路（最终形态）
+
+```
+router(intent=多意图) → task_outputs[pending]
+   └─ fetch_evidence:
+        破损 → _fetch_claim → task.result(success)
+        少件 → _fetch_claim → task.result(success)
+        知识 → knowledge_agent → task.result(knowledge_result)
+   └─ check_evidence → create_draft:
+        ticket.summary = 主诉摘要 + "；另发现少件问题，建议一并处理"
+        reply.checklist = 破损缺证 ∪ 少件缺证（去重保序）
+        reply.content 末尾追加【酒知识解答】
+```
+
+单任务失败时：该任务 `status=failed` 且 `result.error` 落库，其余任务结果保留，整图转 `handoff_human`，不产出工单与回复。
+
