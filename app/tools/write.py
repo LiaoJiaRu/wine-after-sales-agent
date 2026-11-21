@@ -7,9 +7,12 @@
 """
 from __future__ import annotations
 
+import json
+import os
 import time
 import uuid
 from datetime import datetime
+from pathlib import Path
 
 from pydantic import ValidationError
 
@@ -40,6 +43,9 @@ STORAGE_ADVICE = [
 ]
 
 EVIDENCE_POLICY_ID = "P-EVID-001"
+
+# 转人工队列：默认写到项目 data/ 下；测试用 HANDOFF_QUEUE_PATH 覆盖到 tmp_path 隔离
+DEFAULT_HANDOFF_QUEUE = Path(__file__).resolve().parents[2] / "data" / "handoff_queue.jsonl"
 
 
 def _meta(tool: str, t0: float) -> ToolMeta:
@@ -181,3 +187,38 @@ def draft_reply(
         created_at=datetime.now(),
     )
     return DraftReplyOutput(meta=_meta("draft_reply", t0), reply=reply)
+
+
+def _handoff_queue_path() -> Path:
+    raw = (os.getenv("HANDOFF_QUEUE_PATH") or "").strip()
+    return Path(raw) if raw else DEFAULT_HANDOFF_QUEUE
+
+
+def write_handoff_queue(order_id: str, reason: str) -> dict:
+    """转人工写队列（第 9 个工具）：追加一条 JSONL 记录，等待人工审批。
+
+    只写队列，不退款、不改订单状态、不做任何审批动作；approval 由人工在队列侧完成。
+    路径默认 data/handoff_queue.jsonl，可用环境变量 HANDOFF_QUEUE_PATH 覆盖（测试隔离）。
+    """
+    t0 = time.perf_counter()
+
+    if not order_id or not order_id.strip():
+        raise InvalidInputError("order_id 不能为空")
+
+    path = _handoff_queue_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "order_id": order_id.strip(),
+        "reason": (reason or "").strip() or "需要人工介入",
+        "status": "pending_approval",
+    }
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    return {
+        "meta": _meta("write_handoff_queue", t0).model_dump(),
+        "queued": True,
+        "path": str(path),
+        "record": record,
+    }

@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 from langgraph.graph import END, START, StateGraph
@@ -28,7 +29,7 @@ from app.tools.readonly import (
     get_order,
     search_policy,
 )
-from app.tools.write import create_ticket_draft, draft_reply
+from app.tools.write import create_ticket_draft, draft_reply, write_handoff_queue
 
 
 # ---------------------------------------------------------------------------
@@ -128,12 +129,16 @@ _ISSUE_MAP = {
 
 
 def _derive_issue_type(sub_tasks: list[str]) -> str:
-    """从 router.sub_tasks 推导工具层 issue_type；推不出来默认 broken_leak。"""
+    """从 router.sub_tasks 推导工具层 issue_type；识别不到时返回空串。
+
+    不再兜底 broken_leak：物流延迟/真伪争议/标签保质期等非理赔意图若被当成破损，
+    会误算 30% 赔付（354 元）。空串由 fetch_evidence / create_draft 统一转 handoff_human。
+    """
     for t in sub_tasks:
-        mapped = _ISSUE_MAP.get(t.strip())
+        mapped = _ISSUE_MAP.get((t or "").strip())
         if mapped:
             return mapped
-    return "broken_leak"
+    return ""
 
 
 # 合规守卫关键词：只要出现退款/退钱诉求（资金操作）一律转人工，
@@ -272,6 +277,17 @@ def fetch_evidence(state: GraphState) -> dict[str, Any]:
     # —— 兼容路径：单意图，或 task_outputs 为空/无理赔任务 ——
     if not claim_tasks:
         issue_type = state.get("issue_type") or _derive_issue_type(sub_tasks)
+        if not issue_type:
+            return {
+                "handoff": True,
+                "needs_human": True,
+                "issue_type": "",
+                "error": {
+                    "code": "UNSUPPORTED_ISSUE_TYPE",
+                    "message": f"无法识别理赔类型（子任务：{sub_tasks or '空'}），转人工核实",
+                    "retryable": False,
+                },
+            }
         try:
             results = _fetch_claim(order_id, issue_type, provided_evidence, query)
         except (NotFoundError, DataSourceError, ToolError) as exc:
@@ -288,40 +304,65 @@ def fetch_evidence(state: GraphState) -> dict[str, Any]:
             "issue_type": issue_type,
         }
 
-    # —— 多意图路径：逐个子任务执行 ——
-    updated: list[SubTaskState] = []
-    primary: dict[str, Any] | None = None
-    primary_issue = ""
-    first_error: dict[str, Any] | None = None
-
-    for task in tasks:
-        item: SubTaskState = {
+    # —— 多意图路径：理赔任务并发取证（ThreadPoolExecutor），知识任务就地执行 ——
+    updated: list[SubTaskState] = [
+        {
             "task_type": task.get("task_type", ""),
             "status": task.get("status", "pending"),
             "result": task.get("result"),
         }
-        name = (item["task_type"] or "").strip()
-        mapped = _ISSUE_MAP.get(name)
+        for task in tasks
+    ]
 
-        if mapped:
-            try:
-                payload = _fetch_claim(order_id, mapped, provided_evidence, query)
-            except (NotFoundError, DataSourceError, ToolError) as exc:
-                err = {"code": getattr(exc, "code", "TOOL_ERROR"), "message": getattr(exc, "message", str(exc))}
-                item["status"] = "failed"
-                item["result"] = {"error": err}
-                first_error = first_error or err
-                updated.append(item)
-                continue
-            item["status"] = "success"
+    claim_indexes = [
+        idx for idx, item in enumerate(updated) if _ISSUE_MAP.get((item["task_type"] or "").strip())
+    ]
+    outcomes: dict[int, tuple[str, dict[str, Any]]] = {}
+
+    if claim_indexes:
+        # 每个理赔子任务互不共享状态，可安全并发；结果先落 outcomes，再按原顺序回写
+        max_workers = max(1, min(len(claim_indexes), 4))
+        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="claim") as pool:
+            futures = {
+                pool.submit(
+                    _fetch_claim,
+                    order_id,
+                    _ISSUE_MAP[(updated[idx]["task_type"] or "").strip()],
+                    provided_evidence,
+                    query,
+                ): idx
+                for idx in claim_indexes
+            }
+            for future in as_completed(futures):
+                idx = futures[future]
+                try:
+                    outcomes[idx] = ("success", future.result())
+                except (NotFoundError, DataSourceError, ToolError) as exc:
+                    outcomes[idx] = (
+                        "failed",
+                        {"error": {"code": getattr(exc, "code", "TOOL_ERROR"), "message": getattr(exc, "message", str(exc))}},
+                    )
+                except Exception as exc:  # 线程内未预期异常同样降级，不让整图崩
+                    outcomes[idx] = ("failed", {"error": {"code": "INTERNAL", "message": str(exc)}})
+
+    primary: dict[str, Any] | None = None
+    primary_issue = ""
+    first_error: dict[str, Any] | None = None
+
+    for idx, item in enumerate(updated):
+        name = (item["task_type"] or "").strip()
+        if idx in outcomes:
+            status, payload = outcomes[idx]
+            item["status"] = status
             item["result"] = payload
-            if primary is None:
-                primary, primary_issue = payload, mapped
+            if status == "failed":
+                first_error = first_error or payload["error"]
+            elif primary is None:
+                primary, primary_issue = payload, _ISSUE_MAP.get(name, "")
         elif _is_knowledge_task(name):
             knowledge = knowledge_agent(state).get("knowledge_result", "")
             item["result"] = {"knowledge_result": knowledge}
             item["status"] = "success" if knowledge and knowledge != KNOWLEDGE_QUERY_FALLBACK else "failed"
-        updated.append(item)
 
     if first_error is not None:
         return {
@@ -424,6 +465,36 @@ def _merged_evidence(state: GraphState, payloads: list[tuple[str, dict[str, Any]
     return {"complete": complete, "missing": missing}
 
 
+def _secondary_disposition_text(payloads: list[tuple[str, dict[str, Any]]]) -> str:
+    """次要理赔任务的处置动作（补发/赔付/转人工）转成一句客户话术。
+
+    只做字符串拼接，不动 draft_reply 的 Schema；主诉的处置仍在【处理进度】里。
+    """
+    lines: list[str] = []
+    for issue_type, payload in payloads[1:]:
+        comp = payload.get("compensation") or {}
+        rec = comp.get("recommendation")
+        label = _ISSUE_LABELS.get(issue_type, issue_type or "其他")
+        if rec == "reship":
+            lines.append(f"另发现{label}问题，我们将在审核确认后尽快为您安排补发。")
+        elif rec == "partial_refund":
+            amount = float(comp.get("amount") or 0.0)
+            lines.append(
+                f"另发现{label}问题，预计可申请部分赔付 {amount:.2f} 元，最终结果以人工审核为准。"
+            )
+        elif rec == "handoff_human":
+            lines.append(f"另发现{label}问题，需售后专员进一步核实，我们会尽快联系您。")
+    return "\n".join(lines)
+
+
+def _insert_before_section(content: str, section: str, block: str) -> str:
+    """把 block 插到指定板块标题之前；找不到板块就追加到正文末尾。"""
+    idx = content.find(section)
+    if idx < 0:
+        return content.rstrip() + "\n\n" + block
+    return content[:idx] + block + "\n\n" + content[idx:]
+
+
 def create_draft(state: GraphState) -> dict[str, Any]:
     """生成工单草稿 + 回复草稿。任何异常 → handoff/needs_human=True。
 
@@ -434,6 +505,17 @@ def create_draft(state: GraphState) -> dict[str, Any]:
     """
     order_id = state.get("order_id", "")
     issue_type = state.get("issue_type") or _derive_issue_type(state.get("sub_tasks", []))
+    if not issue_type:
+        # 兜底防线：即使上游漏判，也不能凭空 issue_type 生成带赔付的工单
+        return {
+            "handoff": True,
+            "needs_human": True,
+            "error": {
+                "code": "UNSUPPORTED_ISSUE_TYPE",
+                "message": "issue_type 无法识别，转人工核实后再出草稿",
+                "retryable": False,
+            },
+        }
     try:
         payloads = _claim_payloads(state)
         ticket = create_ticket_draft(order_id, issue_type, tool_results=state.get("tool_results", {}))
@@ -458,7 +540,14 @@ def create_draft(state: GraphState) -> dict[str, Any]:
                 "amount": comp.get("amount", 0.0),
             },
         )
-        reply_dict, knowledge = _merge_knowledge_into_reply(state, reply.reply.model_dump())
+        reply_dict = reply.reply.model_dump()
+        disposition = _secondary_disposition_text(payloads)
+        if disposition:
+            # 放在【处理进度】之后、【保存建议】之前，读起来是同一段处理结论
+            reply_dict["content"] = _insert_before_section(
+                reply_dict["content"], "【保存建议】", disposition
+            )
+        reply_dict, knowledge = _merge_knowledge_into_reply(state, reply_dict)
         return {
             "ticket_draft": ticket_draft.model_dump(),
             "reply_draft": reply_dict,
@@ -502,14 +591,26 @@ def knowledge_agent(state: GraphState) -> dict[str, Any]:
 
 
 def handoff_human(state: GraphState) -> dict[str, Any]:
-    """转人工节点：标记 handoff/needs_human=True，携带 error 供人工座席参考。"""
+    """转人工节点：写审批队列（第 9 个工具）+ 标记 handoff/needs_human=True。
+
+    队列只落一条待审批记录，不退款、不改订单状态；写队列失败也不能反过来把图弄崩，
+    因此这里 try/except 后静默降级，状态标记照常返回。
+    """
     err = state.get("error") or {}
+    code = err.get("code", "HANDOFF")
+    message = err.get("message", "需要人工介入")
+    order_id = (state.get("order_id") or "").strip()
+    if order_id:
+        try:
+            write_handoff_queue(order_id, f"[{code}] {message}")
+        except Exception:  # 队列不可用不阻断转人工语义
+            pass
     return {
         "handoff": True,
         "needs_human": True,
         "error": {
-            "code": err.get("code", "HANDOFF"),
-            "message": err.get("message", "需要人工介入"),
+            "code": code,
+            "message": message,
             "retryable": False,
         },
     }
@@ -534,13 +635,17 @@ def _route_after_router(state: GraphState) -> str:
     # router 里 needs_human=True 也走 handoff（空输入、路由降级、非法 intent）
     if state.get("handoff"):
         return "handoff_human"
-    # 酒知识咨询走专业子 Agent：只按 intent 判定，避免“漏了…怎么保存”这类理赔文本被误分流
+    # 酒知识咨询走专业子 Agent：只按 intent 判定，避免"漏了…怎么保存"这类理赔文本被误分流
     intent = state.get("intent")
     if intent in _KNOWLEDGE_INTENTS:
         return "knowledge_agent"
     # 兼容：intent 判成"其他"但子任务只有知识咨询；多意图必须走取证主链（task_outputs 逐任务执行）
     if intent != "多意图" and "储存饮用咨询" in (state.get("sub_tasks") or []):
         return "knowledge_agent"
+    # —— 专业子 Agent 扩展位（M4 启用，当前仅作架构占位）——
+    # app/agents/logistics_agent.py  → intent=物流延迟
+    # app/agents/fake_wine_agent.py  → intent=真伪争议
+    # 现由 fetch_evidence 统一调用只读工具；M4 拆分为独立节点后在此按 intent 分流。
     return "fetch_evidence"
 
 

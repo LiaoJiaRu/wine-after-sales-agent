@@ -40,3 +40,11 @@ def mock_llm_intent(monkeypatch):
 
     monkeypatch.setattr("app.graph.classify_intent", fake_route)
     monkeypatch.setattr("app.cli.route", fake_route)
+
+
+@pytest.fixture(autouse=True)
+def isolate_handoff_queue(tmp_path_factory, monkeypatch):
+    """把转人工队列重定向到临时目录，避免单测往 data/handoff_queue.jsonl 里写脏数据。"""
+    path = tmp_path_factory.mktemp("handoff") / "handoff_queue.jsonl"
+    monkeypatch.setenv("HANDOFF_QUEUE_PATH", str(path))
+    return path

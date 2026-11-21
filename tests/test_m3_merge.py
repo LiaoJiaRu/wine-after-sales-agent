@@ -90,3 +90,30 @@ def test_all_evidence_complete_keeps_single_claim_text(monkeypatch):
     assert "【证据核验】" in content
     assert state["reply_draft"]["checklist"] == []
     assert state["tool_results"]["compensation"]["recommendation"] == "partial_refund"
+
+
+def test_secondary_reship_appended_to_reply(monkeypatch):
+    """证据齐全时，次要诉求（少件 reship）的处置动作必须进入回复正文。"""
+    state = _invoke_mixed(monkeypatch, evidence=["开箱视频", "面单照片", "破损部位照片", "整箱称重照片"])
+    content = state["reply_draft"]["content"]
+
+    # 主诉结论仍在
+    assert "354.00 元" in content
+    assert "人工审核" in content
+    # 次要诉求的补发动作已合并
+    assert "少件" in content
+    assert "补发" in content
+    # 位置合理：处理进度之后、保存建议之前，且不与主诉话术重复
+    assert content.index("【处理进度】") < content.index("补发") < content.index("【保存建议】")
+    assert content.count("预计金额") == 1
+
+
+def test_secondary_reship_absent_for_single_claim(monkeypatch):
+    """单理赔任务不追加少件话术（防串话）。"""
+    state = GR.invoke({"user_text": "我买的酒漏了", "order_id": ORDER_ID,
+                       "evidence": ["开箱视频", "面单照片", "破损部位照片"]})
+    content = state["reply_draft"]["content"]
+
+    assert "354.00 元" in content
+    assert "少件" not in content
+    assert "补发" not in content
