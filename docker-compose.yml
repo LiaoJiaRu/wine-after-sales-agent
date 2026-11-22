@@ -1,0 +1,30 @@
+services:
+  # 容器内跑测试：不依赖 .env（无 Key 时 Judge 走 Fail-Open 降级），
+  # 也不依赖真实 Redis（连不上时 redis_client 自动降级为进程内实现）。
+  app:
+    build: .
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+    restart: "no"
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+
+  redis:
+    image: redis:7-alpine
+    # 仅绑定宿主机 127.0.0.1，供本地 pytest / CLI 使用
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  redis_data:

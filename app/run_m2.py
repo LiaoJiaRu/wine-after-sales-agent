@@ -16,7 +16,7 @@ from __future__ import annotations
 import argparse
 import json
 
-from app.graph import compile_graph
+from app.graph import RECURSION_LIMIT, compile_graph
 
 # broken_leak 要求的完整证据三项（与 readonly.REQUIRED_EVIDENCE 对齐）
 FULL_EVIDENCE = ["开箱视频", "面单照片", "破损部位照片"]
@@ -44,7 +44,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.with_evidence:
         initial_state["evidence"] = list(FULL_EVIDENCE)
 
-    state = compile_graph().invoke(initial_state)
+    state = compile_graph().invoke(initial_state, config={"recursion_limit": RECURSION_LIMIT})
 
     print("=" * 60)
     print(f"幕次: {'第二幕（证据齐全）' if args.with_evidence else '第一幕（无证据）'}")

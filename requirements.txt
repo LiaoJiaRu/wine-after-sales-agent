@@ -13,3 +13,4 @@ langfuse>=3.0
 streamlit>=1.37,<2
 httpx>=0.27,<1
 pytest>=8.2,<9
+fakeredis>=2.20,<3

@@ -48,3 +48,43 @@ def isolate_handoff_queue(tmp_path_factory, monkeypatch):
     path = tmp_path_factory.mktemp("handoff") / "handoff_queue.jsonl"
     monkeypatch.setenv("HANDOFF_QUEUE_PATH", str(path))
     return path
+
+
+@pytest.fixture(autouse=True)
+def isolate_memory(tmp_path_factory, monkeypatch):
+    """M4：每个测试独立 SQLite 文件 + fakeredis 替身。
+
+    - SQLite 指向 tmp_path，绝不写真实 data/wine_after_sales.db；
+    - Redis 用 fakeredis（TTL/增量写语义与真实 Redis 一致），fakeredis 不可用时退回进程内实现；
+    - 队列路径由 isolate_handoff_queue 单独重定向。
+    """
+    from app.memory import redis_client
+
+    db_path = tmp_path_factory.mktemp("memory") / "tickets.db"
+    monkeypatch.setenv("TICKETS_DB_PATH", str(db_path))
+
+    try:
+        import fakeredis
+
+        fake = fakeredis.FakeRedis(decode_responses=True)
+    except Exception:  # pragma: no cover - fakeredis 未安装时兜底
+        fake = redis_client._MemoryClient()
+
+    redis_client.reset_client()
+    monkeypatch.setattr(redis_client, "_client", fake)
+    yield db_path
+    redis_client.reset_client()
+
+
+@pytest.fixture(autouse=True)
+def mock_judge(monkeypatch):
+    """Judge 默认放行：单测禁止发真实 LLM 请求（Docker 内无 Key）。
+
+    test_m4_judge.py 会在单个用例里再次 monkeypatch 覆盖本 fixture（后写生效）。
+    """
+    monkeypatch.setattr(
+        "app.graph.judge_draft",
+        lambda _state: {"pass": True, "reason": "OK(mock)", "failed_node": ""},
+    )
+
+

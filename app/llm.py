@@ -246,3 +246,118 @@ def classify_intent(text: str) -> IntentDecision:
             ]
 
     return _degraded("INVALID_JSON", f"输出未通过 Schema 校验（已重试一次）: {last_error}")
+
+
+# ---------------------------------------------------------------------------
+# M4：Judge 结构化裁决
+# ---------------------------------------------------------------------------
+
+JUDGE_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "judge_v1.txt"
+JUDGE_REPAIR_PROMPT = (
+    "你的上一条输出无法通过 JSON Schema 校验：{error}\n"
+    '请只输出一个合法 JSON 对象，字段为 pass（布尔）、reason（字符串）、failed_node（"create_draft" 或 "fetch_evidence" 或空串），'
+    "不要任何解释或代码块。"
+)
+
+
+class JudgeVerdict(BaseModel):
+    """Judge 裁决结果。pass 是 Python 关键字，用别名映射。"""
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    passed: bool = Field(alias="pass")
+    reason: str = ""
+    failed_node: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "pass": self.passed,
+            "reason": self.reason,
+            "failed_node": self.failed_node,
+        }
+
+
+@lru_cache(maxsize=1)
+def load_judge_prompt() -> str:
+    if not JUDGE_PROMPT_PATH.exists():
+        raise LLMError(f"Judge Prompt 文件缺失: {JUDGE_PROMPT_PATH}", code="PROMPT_MISSING")
+    return JUDGE_PROMPT_PATH.read_text(encoding="utf-8")
+
+
+def _judge_payload(state: dict) -> str:
+    """把待审内容压缩成 Judge 可读的 JSON（截断长文本，避免超长请求）。"""
+    ticket = state.get("ticket_draft") or {}
+    reply = state.get("reply_draft") or {}
+    compensation = (state.get("tool_results") or {}).get("compensation") or {}
+    payload = {
+        "issue_type": ticket.get("issue_type") or state.get("issue_type", ""),
+        "order_id": ticket.get("order_id") or state.get("order_id", ""),
+        "ticket_summary": (ticket.get("summary") or "")[:800],
+        "compensation": {
+            "recommendation": compensation.get("recommendation"),
+            "amount": compensation.get("amount"),
+            "reason": compensation.get("reason", ""),
+        },
+        "evidence_status": state.get("evidence_status") or ticket.get("evidence_status") or {},
+        "checklist": reply.get("checklist") or [],
+        "reply_content": (reply.get("content") or "")[:2000],
+    }
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def parse_judge(raw: str) -> JudgeVerdict:
+    text = (raw or "").strip()
+    fence = _FENCE_RE.search(text)
+    if fence:
+        text = fence.group(1).strip()
+    if not text.startswith("{"):
+        obj = _OBJECT_RE.search(text)
+        if not obj:
+            raise ValueError("输出中未找到 JSON 对象")
+        text = obj.group(0)
+    data = json.loads(text)
+    if not isinstance(data, dict):
+        raise ValueError("JSON 顶层必须是对象")
+    return JudgeVerdict.model_validate(data)
+
+
+def judge_draft(state: dict) -> dict:
+    """对草稿做二次审核：调 LLM → Schema 校验 → 一次修复重试。
+
+    LLM 不可用（无 Key / 超时）时抛 LLMError，由调用方决定降级策略；
+    输出始终不合法则 fail-closed（pass=False），交给人工。
+    """
+    messages = [
+        {"role": "system", "content": load_judge_prompt()},
+        {"role": "user", "content": _judge_payload(state)},
+    ]
+    last_error = ""
+    for attempt in range(MAX_REPAIR + 1):
+        span_name = "judge_llm" if attempt == 0 else "judge_llm_repair"
+        with trace_span(
+            span_name,
+            as_type="generation",
+            model=MODEL,
+            input=messages,
+            metadata={"attempt": attempt + 1},
+        ) as span:
+            raw = complete(messages)
+            if span is not None:
+                try:
+                    span.update(output=raw)
+                except Exception:
+                    pass
+        try:
+            return parse_judge(raw).to_dict()
+        except (ValueError, ValidationError) as exc:
+            last_error = str(exc)[:300]
+            messages = messages + [
+                {"role": "assistant", "content": raw[:1200]},
+                {"role": "user", "content": JUDGE_REPAIR_PROMPT.format(error=last_error)},
+            ]
+
+    return {
+        "pass": False,
+        "reason": f"Judge 输出未通过 Schema 校验（已重试一次）: {last_error}",
+        "failed_node": "create_draft",
+    }

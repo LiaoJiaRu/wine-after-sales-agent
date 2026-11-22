@@ -19,7 +19,10 @@ from langgraph.graph import END, START, StateGraph
 from typing_extensions import TypedDict
 
 from app.agents.router import route as classify_intent
+from app.llm import LLMError, judge_draft
+from app.memory import redis_client, sqlite_client
 from app.tools.errors import DataSourceError, NotFoundError, ToolError
+from app.tools.schemas import EvidenceStatus
 from app.tools.readonly import (
     KNOWLEDGE_KEYWORDS,
     calc_compensation,
@@ -84,6 +87,8 @@ class GraphState(TypedDict, total=False):
     reply_draft: dict[str, Any] | None
     knowledge_result: str        # knowledge_agent 写回的酒知识说明（M3 新增）
     task_outputs: list[SubTaskState]  # 多意图子任务对象列表（M3 补齐阶段1，intent=多意图 时由 router 生成）
+    session_id: str              # 多轮会话标识（M4 新增）：有值时 load_session 读 Redis、create_draft 写 Redis
+    judge_feedback: str          # Judge 复核意见（M4 阶段3）：失败重跑时注入下一轮 create_draft/fetch_evidence
     error: dict[str, Any]
     needs_human: bool            # CLI 层的 needs_human 标志（graph.handoff 与 needs_human 含义相同，双写便于 CLI 直接取）
 
@@ -93,6 +98,8 @@ DEFAULT_EMPTY: GraphState = {
     "issue_type": "",
     "intent": "",
     "sub_tasks": [],
+    "session_id": "",
+    "judge_feedback": "",
     "tool_results": {},
     "evidence_status": {},
     "judge_result": None,
@@ -156,16 +163,35 @@ _REFUND_KEYWORDS = (
 
 
 def load_session(state: GraphState) -> dict[str, Any]:
-    """会话加载（当前先 Mock 透传：只保证 order_id 存在）。
+    """会话加载（M4）：有 session_id 时从 Redis 拉回上一轮的 order_id / evidence。
 
-    M4 接 Redis 后在这里把会话槽位/历史拉回来；当前骨架只做空输入守卫：
-    order_id 为空时直接进 handoff，避免后续节点炸。
+    合并规则：本轮 State 显式传入的字段优先，历史只补空缺（不覆盖用户新输入）。
+    Redis 不可用时 redis_client 自动降级为进程内字典，这里不感知、不抛错。
 
     同时把作业1-1 表4 要求的两个非必填字段（retry_count / judge_result）显式写回，
     否则 LangGraph 0.2 TypedDict State 不会把它们收集到 invoke 结果里。
     """
-    order_id = (state.get("order_id") or "").strip()
-    common_fills = {"retry_count": 0, "judge_result": None}
+    session_id = (state.get("session_id") or "").strip()
+    history: dict[str, Any] = {}
+    slots: dict[str, Any] = {}
+    if session_id:
+        try:
+            history = redis_client.load_session(session_id) or {}
+            slots = history.get("slots") or {}
+        except Exception:  # 缓存故障不允许阻断主链路
+            history, slots = {}, {}
+
+    order_id = (state.get("order_id") or "").strip() or str(slots.get("order_id") or "").strip()
+    evidence = list(state.get("evidence") or [])
+    if not evidence:
+        history_evidence = slots.get("evidence") or []
+        if isinstance(history_evidence, str):
+            history_evidence = [history_evidence]
+        evidence = [str(item) for item in history_evidence]
+
+    common_fills: dict[str, Any] = {"retry_count": 0, "judge_result": None}
+    if session_id:
+        common_fills["session_id"] = session_id
     if not order_id:
         return {
             "handoff": True,
@@ -173,7 +199,11 @@ def load_session(state: GraphState) -> dict[str, Any]:
             "error": {"code": "EMPTY_ORDER_ID", "message": "order_id 为空，无法加载会话", "retryable": False},
             **common_fills,
         }
-    return {"order_id": order_id, **common_fills}
+
+    merged: dict[str, Any] = {"order_id": order_id, **common_fills}
+    if evidence:
+        merged["evidence"] = evidence
+    return merged
 
 
 def _build_task_outputs(intent: str, sub_tasks: list[str]) -> list[SubTaskState]:
@@ -192,6 +222,39 @@ def _build_task_outputs(intent: str, sub_tasks: list[str]) -> list[SubTaskState]
     return outputs
 
 
+# 证据槽位关键词：顺序与 REQUIRED_EVIDENCE 对齐，便于合并后保持稳定顺序
+_EVIDENCE_KEYWORDS = ("开箱视频", "面单照片", "破损部位照片", "整箱称重照片")
+_NEGATIONS = ("还没", "没", "未", "无", "没有")
+
+
+def extract_evidence_from_text(text: str) -> list[str]:
+    """从用户原话里抽取"已提供"的证据（M4 槽位填充）。
+
+    纯关键词映射，但做两点防护，避免把"还没拍开箱视频""开箱视频要拍吗"误判为已提供：
+    - 关键词前 6 个字内出现否定词（没/未/无/没有/还没）→ 跳过；
+    - 关键词后 4 个字内出现疑问词（吗/？/?/怎么）→ 跳过。
+
+    只做提取，不校验真伪；证据是否齐全仍由 check_evidence 判定。
+    """
+    text = text or ""
+    found: list[str] = []
+    for keyword in _EVIDENCE_KEYWORDS:
+        start = text.find(keyword)
+        while start >= 0:
+            head = text[max(0, start - 6):start]
+            tail = text[start + len(keyword):start + len(keyword) + 6]
+            negated = any(word in head for word in _NEGATIONS) or any(
+                word in tail for word in ("没有", "还没", "未", "无")
+            )
+            questioned = any(word in tail[:4] for word in ("吗", "？", "?", "怎么"))
+            if not negated and not questioned:
+                found.append(keyword)
+                break
+            start = text.find(keyword, start + len(keyword))
+    # 按标准顺序返回，避免用户叙述顺序影响下游展示
+    return [item for item in _EVIDENCE_KEYWORDS if item in found]
+
+
 def router(state: GraphState) -> dict[str, Any]:
     """复用现有 route()。同时把 needs_human 同步到 State.needs_human，便于 CLI 层直接取。
 
@@ -199,6 +262,9 @@ def router(state: GraphState) -> dict[str, Any]:
     直接置 handoff/needs_human=True（error.code=COMPLIANCE_REFUND），由条件边转 handoff_human。
     该判定排在知识分流之前，因此"退款 + 酒知识"混装诉求只会转人工，不会解答知识。
     草稿工具本身只生成草稿、不退款，这里是第一道拦截。
+
+    M4 槽位填充：从原话抽取"已上传/已提供"的证据，与历史证据合并去重后写回 State，
+    使多轮补证（仅给 session_id + "我已经上传了…"）也能重新算出赔付。
     """
     text = state.get("user_text", "") or state.get("text", "") or ""
     if any(k in text for k in _REFUND_KEYWORDS):
@@ -217,6 +283,13 @@ def router(state: GraphState) -> dict[str, Any]:
     decision = classify_intent(text)
     handoff = bool(decision.needs_human)
     sub_tasks = decision.sub_tasks or []
+
+    extracted = extract_evidence_from_text(text)
+    merged_evidence = list(state.get("evidence") or [])
+    for item in extracted:
+        if item not in merged_evidence:
+            merged_evidence.append(item)
+
     return {
         "intent": decision.intent,
         "sub_tasks": sub_tasks,
@@ -225,6 +298,7 @@ def router(state: GraphState) -> dict[str, Any]:
         "needs_human": handoff,
         "error": decision.error or {},
         "user_text": text,
+        "evidence": merged_evidence,
     }
 
 
@@ -276,7 +350,9 @@ def fetch_evidence(state: GraphState) -> dict[str, Any]:
 
     # —— 兼容路径：单意图，或 task_outputs 为空/无理赔任务 ——
     if not claim_tasks:
-        issue_type = state.get("issue_type") or _derive_issue_type(sub_tasks)
+        issue_type = state.get("issue_type") or _derive_issue_type(
+            sub_tasks or [state.get("intent", "")]
+        )
         if not issue_type:
             return {
                 "handoff": True,
@@ -375,12 +451,32 @@ def fetch_evidence(state: GraphState) -> dict[str, Any]:
 
     assert primary is not None  # claim_tasks 非空，循环内至少成功一次
     primary["sub_tasks"] = sub_tasks
+
+    # M4 修复：多理赔任务时 evidence_status 必须合并所有任务的缺证项，
+    # 否则 Judge/回复只看到主诉的缺证，少件的"整箱称重照片"会被漏掉。
+    payloads = [
+        task.get("result") or {}
+        for task in updated
+        if (task.get("result") or {}).get("evidence")
+    ]
+    merged_evidence = dict(primary["evidence"])
+    if len(payloads) > 1:
+        missing: list[str] = []
+        complete = True
+        for payload in payloads:
+            ev = payload.get("evidence") or {}
+            complete = complete and bool(ev.get("complete"))
+            for item in ev.get("missing") or []:
+                if item not in missing:
+                    missing.append(item)
+        merged_evidence.update({"complete": complete, "missing": missing})
+
     return {
         "task_outputs": updated,
         "order": primary["order"],
         "shipment": primary["shipment"],
         "batch": primary["batch"],
-        "evidence_status": primary["evidence"],
+        "evidence_status": merged_evidence,
         "tool_results": primary,
         "issue_type": primary_issue,
     }
@@ -495,6 +591,34 @@ def _insert_before_section(content: str, section: str, block: str) -> str:
     return content[:idx] + block + "\n\n" + content[idx:]
 
 
+def _persist_ticket(state: GraphState, ticket_draft: Any, reply_content: str) -> None:
+    """M4：工单落 SQLite + 会话槽位写 Redis。
+
+    两者都是"尽力而为"：数据库/缓存故障只降级，不允许影响草稿产出（草稿本身不落库）。
+    """
+    try:
+        sqlite_client.save_ticket(ticket_draft.model_dump())
+    except Exception:
+        pass
+
+    session_id = (state.get("session_id") or "").strip()
+    if not session_id:
+        return
+    try:
+        redis_client.save_session(
+            session_id,
+            summary=f"{ticket_draft.issue_type} | {(reply_content or '')[:80]}",
+            slots={
+                "order_id": ticket_draft.order_id,
+                "issue_type": ticket_draft.issue_type,
+                "evidence": [str(item) for item in (state.get("evidence") or [])],
+                "ticket_draft_id": ticket_draft.draft_id,
+            },
+        )
+    except Exception:
+        pass
+
+
 def create_draft(state: GraphState) -> dict[str, Any]:
     """生成工单草稿 + 回复草稿。任何异常 → handoff/needs_human=True。
 
@@ -504,7 +628,9 @@ def create_draft(state: GraphState) -> dict[str, Any]:
     - 多意图（理赔 + 酒知识）时再把知识条目追加到回复末尾。
     """
     order_id = state.get("order_id", "")
-    issue_type = state.get("issue_type") or _derive_issue_type(state.get("sub_tasks", []))
+    issue_type = state.get("issue_type") or _derive_issue_type(
+        state.get("sub_tasks") or [state.get("intent", "")]
+    )
     if not issue_type:
         # 兜底防线：即使上游漏判，也不能凭空 issue_type 生成带赔付的工单
         return {
@@ -519,14 +645,24 @@ def create_draft(state: GraphState) -> dict[str, Any]:
     try:
         payloads = _claim_payloads(state)
         ticket = create_ticket_draft(order_id, issue_type, tool_results=state.get("tool_results", {}))
-        suffix = _secondary_claim_suffix(payloads)
-        ticket_draft = (
-            ticket.draft.model_copy(update={"summary": ticket.draft.summary + suffix})
-            if suffix
-            else ticket.draft
-        )
-
         ev_status = _merged_evidence(state, payloads)
+
+        update: dict[str, Any] = {}
+        suffix = _secondary_claim_suffix(payloads)
+        if suffix:
+            update["summary"] = ticket.draft.summary + suffix
+        # 多意图：工单证据状态与 State 对齐（union missing），避免与回复清单不一致
+        update["evidence_status"] = EvidenceStatus(
+            complete=bool(ev_status.get("complete", True)),
+            missing=list(ev_status.get("missing") or []),
+        )
+        # 重跑时把 Judge 的复核意见注入工单上下文，便于追溯本轮修复点
+        feedback = (state.get("judge_feedback") or "").strip()
+        if feedback:
+            base = update.get("summary", ticket.draft.summary)
+            update["summary"] = f"{base}（质检复核：{feedback[:60]}）"
+        ticket_draft = ticket.draft.model_copy(update=update)
+
         comp = state.get("tool_results", {}).get("compensation") or {}
         order_dict = state.get("order") or {}
         reply = draft_reply(
@@ -548,6 +684,7 @@ def create_draft(state: GraphState) -> dict[str, Any]:
                 reply_dict["content"], "【保存建议】", disposition
             )
         reply_dict, knowledge = _merge_knowledge_into_reply(state, reply_dict)
+        _persist_ticket(state, ticket_draft, reply_dict.get("content", ""))
         return {
             "ticket_draft": ticket_draft.model_dump(),
             "reply_draft": reply_dict,
@@ -654,6 +791,86 @@ def _route_after_load(state: GraphState) -> str:
     return "handoff_human" if state.get("handoff") else "router"
 
 
+MAX_JUDGE_RETRY = 2  # 局部重跑上限：Judge 连续失败 3 次（首次 + 2 次重试）转人工
+RECURSION_LIMIT = 16  # 图执行步数上限，双保险防死循环（节点内已有 retry_count 闸门）
+
+
+def judge(state: GraphState) -> dict[str, Any]:
+    """M4：LLM Judge 二次审核 create_draft 的产物。
+
+    - pass=True  → 正常结束（persist 节点留到 M4 后续阶段）
+    - pass=False → 按 failed_node 局部重跑（retry_count + 1，最多 2 次），
+                  复核意见写入 judge_feedback 供下一轮 create_draft 读取
+    - retry_count 达上限 → handoff，error.code=JUDGE_REJECTED
+    - LLM 不可用（无 Key / 超时）→ 降级放行并标记 degraded=True，
+      避免离线/Docker 环境因质检不可用而整链路瘫痪（确定性守卫仍在前面兜底）
+    """
+    if state.get("handoff") or not state.get("ticket_draft"):
+        return {}
+    try:
+        verdict = judge_draft(state)
+    except LLMError as exc:
+        return {
+            "judge_result": {
+                "pass": True,
+                "reason": f"Judge 不可用（{exc.code}），降级放行",
+                "failed_node": "",
+                "degraded": True,
+            },
+            "judge_feedback": "",
+        }
+    except Exception as exc:  # 任何未预期异常都不允许让草稿流程崩掉
+        return {
+            "judge_result": {
+                "pass": True,
+                "reason": f"Judge 异常，降级放行：{exc}",
+                "failed_node": "",
+                "degraded": True,
+            },
+            "judge_feedback": "",
+        }
+
+    if verdict.get("pass"):
+        return {"judge_result": verdict, "judge_feedback": ""}
+
+    reason = verdict.get("reason") or "Judge 判定草稿不通过"
+    failed_node = verdict.get("failed_node") or "create_draft"
+    if failed_node not in ("create_draft", "fetch_evidence"):
+        failed_node = "create_draft"
+    verdict["failed_node"] = failed_node
+
+    retry_count = int(state.get("retry_count") or 0)
+    if retry_count >= MAX_JUDGE_RETRY:
+        return {
+            "judge_result": verdict,
+            "judge_feedback": reason,
+            "retry_count": retry_count,
+            "handoff": True,
+            "needs_human": True,
+            "error": {
+                "code": "JUDGE_REJECTED",
+                "message": f"{reason}（已重试 {retry_count} 次，转人工）",
+                "retryable": False,
+            },
+        }
+
+    return {
+        "judge_result": verdict,
+        "judge_feedback": reason,
+        "retry_count": retry_count + 1,
+    }
+
+
+def _route_after_judge(state: GraphState) -> str:
+    if state.get("handoff"):
+        return "handoff_human"
+    verdict = state.get("judge_result") or {}
+    if verdict.get("pass"):
+        return END
+    # 局部重跑：按 Judge 指认的失败节点回跳，最多 MAX_JUDGE_RETRY 次
+    return "fetch_evidence" if verdict.get("failed_node") == "fetch_evidence" else "create_draft"
+
+
 # ---------------------------------------------------------------------------
 # compile_graph
 # ---------------------------------------------------------------------------
@@ -668,6 +885,7 @@ def compile_graph():
     sg.add_node("fetch_evidence", fetch_evidence)
     sg.add_node("check_evidence", check_evidence)
     sg.add_node("create_draft", create_draft)
+    sg.add_node("judge", judge)
     sg.add_node("knowledge_agent", knowledge_agent)
     sg.add_node("handoff_human", handoff_human)
 
@@ -677,7 +895,8 @@ def compile_graph():
     sg.add_conditional_edges("router", _route_after_router)
     sg.add_conditional_edges("fetch_evidence", _route_after_fetch)
     sg.add_edge("check_evidence", "create_draft")
-    sg.add_edge("create_draft", END)
+    sg.add_edge("create_draft", "judge")
+    sg.add_conditional_edges("judge", _route_after_judge)
     sg.add_edge("knowledge_agent", END)
     sg.add_edge("handoff_human", END)
 
