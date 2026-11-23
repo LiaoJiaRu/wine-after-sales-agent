@@ -6,6 +6,8 @@
    涉及金额时必须写明"最终结果以人工审核为准"。
 2. 金额必须与系统计算结果一致：回复中出现的赔付金额与 compensation.amount 一致（保留两位小数），
    不得自行加价、减免或编造金额。
+   缺证补证场景例外：当 evidence_status.complete 为 false 且 compensation.recommendation 为 supplement_evidence 时，
+   不核对金额，也不要求回复必须出现金额；只要清单完整且无退款承诺即放行（仍需满足事实不得矛盾）。
 3. 补证清单必须完整：evidence_status.complete 为 false 时，回复必须包含【需要您补充的材料】，
    且缺少的材料与 evidence_status.missing 一一对应，不得漏项。
 4. 事实不得矛盾：summary、回复正文、compensation 三者对同一问题的描述应一致。

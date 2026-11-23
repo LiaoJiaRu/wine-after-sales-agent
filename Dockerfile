@@ -12,4 +12,4 @@ RUN pip install --no-cache-dir -r requirements.txt \
 
 COPY . .
 
-CMD ["python", "-m", "pytest", "-q"]
+CMD ["streamlit", "run", "ui/streamlit_app.py", "--server.port=8000", "--server.address=0.0.0.0"]

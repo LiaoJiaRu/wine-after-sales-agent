@@ -132,6 +132,32 @@ def test_retry_is_bounded_no_recursion_error(monkeypatch):
     assert g.RECURSION_LIMIT >= 2 * (g.MAX_JUDGE_RETRY + 1)
 
 
+def test_failed_node_fetch_evidence_bounded_no_recursion_error(monkeypatch, isolate_handoff_queue):
+    """多意图连续驳回取证也必须完成两次重跑并转人工，不得先耗尽图步数。"""
+    _stub_intent(
+        monkeypatch,
+        intent="多意图",
+        sub_tasks=["破损漏液", "少件错发", "储存饮用咨询"],
+    )
+    calls = _scripted_judge(
+        monkeypatch,
+        [{"pass": False, "reason": "持续驳回取证", "failed_node": "fetch_evidence"}],
+    )
+
+    state = GR.invoke(
+        {"user_text": "我买的酒漏了，还少一瓶，这酒怎么保存", "order_id": ORDER_ID},
+        config={"recursion_limit": g.RECURSION_LIMIT},
+    )
+
+    assert calls["n"] == g.MAX_JUDGE_RETRY + 1
+    assert state["retry_count"] == g.MAX_JUDGE_RETRY
+    assert state["handoff"] is True
+    assert state["error"]["code"] == "JUDGE_REJECTED"
+    assert g._route_after_judge(
+        {"retry_count": g.MAX_JUDGE_RETRY, "judge_result": {"pass": False}}
+    ) == "handoff_human"
+
+
 def test_multi_intent_evidence_merged_everywhere(monkeypatch):
     """漏了 + 少件 + 保存：State / 工单 / 回复清单必须是同一份合并后的缺证列表。"""
     _stub_intent(

@@ -361,3 +361,38 @@ def judge_draft(state: dict) -> dict:
         "reason": f"Judge 输出未通过 Schema 校验（已重试一次）: {last_error}",
         "failed_node": "create_draft",
     }
+
+
+# ---------------------------------------------------------------------------
+# M5：回复润色
+# ---------------------------------------------------------------------------
+
+POLISH_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "polish_v1.txt"
+
+
+@lru_cache(maxsize=1)
+def load_polish_prompt() -> str:
+    if not POLISH_PROMPT_PATH.exists():
+        raise LLMError(f"Polish Prompt 文件缺失: {POLISH_PROMPT_PATH}", code="PROMPT_MISSING")
+    return POLISH_PROMPT_PATH.read_text(encoding="utf-8")
+
+
+def polish_reply(reply_content: str) -> str:
+    """调用 DeepSeek 润色回复；异常交由图节点降级，不阻断主链。"""
+    messages = [
+        {"role": "system", "content": load_polish_prompt()},
+        {"role": "user", "content": reply_content},
+    ]
+    with trace_span(
+        "polish_llm",
+        as_type="generation",
+        model=MODEL,
+        input=messages,
+    ) as span:
+        polished = complete(messages)
+        if span is not None:
+            try:
+                span.update(output=polished)
+            except Exception:
+                pass
+    return polished

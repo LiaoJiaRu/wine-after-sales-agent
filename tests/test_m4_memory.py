@@ -152,3 +152,40 @@ def test_multi_intent_ticket_persisted_once(monkeypatch):
     rows = sqlite_client.get_tickets_by_order(ORDER_ID)
     assert len(rows) == 1
     assert "少件" in rows[0]["summary"]
+
+
+def test_merchant_review_lists_and_updates_draft(monkeypatch):
+    """商家审核端依赖：按 status 查询工单并更新状态。"""
+    _stub(monkeypatch)
+    sqlite_client.init_db()
+    state = GR.invoke(
+        {"user_text": "酒瓶漏了", "order_id": ORDER_ID, "evidence": FULL_EVIDENCE}
+    )
+    draft_id = state["ticket_draft"]["draft_id"]
+
+    drafts = sqlite_client.list_tickets(status="draft")
+    assert [row["draft_id"] for row in drafts] == [draft_id]
+    assert drafts[0]["amount"] == 354.0
+
+    assert sqlite_client.update_ticket_status(draft_id, "approved") is True
+    assert sqlite_client.list_tickets(status="draft") == []
+    assert sqlite_client.list_tickets(status="approved")[0]["draft_id"] == draft_id
+    assert sqlite_client.update_ticket_status("TD-NOT-EXIST", "approved") is False
+
+
+def test_repeat_apply_for_same_order_supersedes_old_draft(monkeypatch):
+    """同一订单重复申请：旧待审工单置为 superseded，draft 只保留最新一条。"""
+    _stub(monkeypatch)
+    first = GR.invoke({"user_text": "酒瓶漏了", "order_id": ORDER_ID})
+    old_id = first["ticket_draft"]["draft_id"]
+
+    second = GR.invoke({"user_text": "酒瓶又漏了", "order_id": ORDER_ID})
+    new_id = second["ticket_draft"]["draft_id"]
+    assert new_id != old_id
+
+    drafts = sqlite_client.list_tickets(status="draft")
+    assert [row["draft_id"] for row in drafts] == [new_id]
+
+    all_rows = {row["draft_id"]: row for row in sqlite_client.list_tickets()}
+    assert all_rows[old_id]["status"] == "superseded"
+    assert all_rows[new_id]["status"] == "draft"

@@ -88,3 +88,9 @@ def mock_judge(monkeypatch):
     )
 
 
+@pytest.fixture(autouse=True)
+def mock_polish(monkeypatch):
+    """润色默认原样放行，避免既有测试依赖真实 DeepSeek；专项用例可再次覆盖。"""
+    monkeypatch.setattr("app.graph.polish_reply", lambda content: content)
+
+

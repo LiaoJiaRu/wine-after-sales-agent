@@ -13,13 +13,14 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import re
 from typing import Any
 
 from langgraph.graph import END, START, StateGraph
 from typing_extensions import TypedDict
 
 from app.agents.router import route as classify_intent
-from app.llm import LLMError, judge_draft
+from app.llm import LLMError, judge_draft, polish_reply
 from app.memory import redis_client, sqlite_client
 from app.tools.errors import DataSourceError, NotFoundError, ToolError
 from app.tools.schemas import EvidenceStatus
@@ -628,6 +629,10 @@ def create_draft(state: GraphState) -> dict[str, Any]:
     - 多意图（理赔 + 酒知识）时再把知识条目追加到回复末尾。
     """
     order_id = state.get("order_id", "")
+    retry_count = int(state.get("retry_count") or 0)
+    if (state.get("judge_result") or {}).get("pass") is False:
+        # 只有实际进入草稿重跑才消耗一次重试额度；首次生成不递增。
+        retry_count += 1
     issue_type = state.get("issue_type") or _derive_issue_type(
         state.get("sub_tasks") or [state.get("intent", "")]
     )
@@ -690,6 +695,7 @@ def create_draft(state: GraphState) -> dict[str, Any]:
             "ticket_draft": ticket_draft.model_dump(),
             "reply_draft": reply_dict,
             "knowledge_result": knowledge,
+            "retry_count": retry_count,
             "handoff": handoff,
             "needs_human": handoff,
             "error": (
@@ -705,6 +711,42 @@ def create_draft(state: GraphState) -> dict[str, Any]:
         }
     except Exception as exc:  # pragma: no cover - 兜底
         return {"handoff": True, "needs_human": True, "error": {"code": "INTERNAL", "message": str(exc)}}
+
+
+_POLISH_AMOUNT_RE = re.compile(r"\d+(?:\.\d+)?\s*元")
+_POLISH_ORDER_RE = re.compile(r"[A-Z]{2,}[A-Z0-9-]*\d[A-Z0-9-]*")
+_POLISH_NUMBERED_LINE_RE = re.compile(r"^\s*\d+）.+$", re.MULTILINE)
+_POLISH_FORBIDDEN_PROMISES = ("已退款", "立即退款", "保证退款", "直接退给您", "已补发", "保证补发")
+
+
+def _polish_preserves_locked_facts(original: str, polished: str) -> bool:
+    """确定性检查关键事实，LLM 越界时由节点回退原稿。"""
+    if not polished.strip():
+        return False
+    if sorted(_POLISH_AMOUNT_RE.findall(original)) != sorted(_POLISH_AMOUNT_RE.findall(polished)):
+        return False
+    if sorted(_POLISH_ORDER_RE.findall(original)) != sorted(_POLISH_ORDER_RE.findall(polished)):
+        return False
+    if any(line.strip() not in polished for line in _POLISH_NUMBERED_LINE_RE.findall(original)):
+        return False
+    if ("人工审核" in original) != ("人工审核" in polished):
+        return False
+    return not any(promise in polished for promise in _POLISH_FORBIDDEN_PROMISES)
+
+
+def polish(state: GraphState) -> dict[str, Any]:
+    """只润色回复表达；空稿跳过，失败或事实变化均保留原版草稿。"""
+    reply = state.get("reply_draft") or {}
+    original = (reply.get("content") or "").strip()
+    if not original:
+        return {}
+    try:
+        polished = polish_reply(original).strip()
+    except Exception:
+        return {}
+    if not _polish_preserves_locked_facts(original, polished):
+        return {}
+    return {"reply_draft": {**reply, "content": polished}}
 
 
 KNOWLEDGE_QUERY_FALLBACK = "关于该问题我暂时没有找到相关说明"
@@ -798,14 +840,14 @@ def _route_after_load(state: GraphState) -> str:
 
 
 MAX_JUDGE_RETRY = 2  # 局部重跑上限：Judge 连续失败 3 次（首次 + 2 次重试）转人工
-RECURSION_LIMIT = 16  # 图执行步数上限，双保险防死循环（节点内已有 retry_count 闸门）
+RECURSION_LIMIT = 32  # 容纳首次审核 + 两次取证重跑 + polish，双保险防死循环
 
 
 def judge(state: GraphState) -> dict[str, Any]:
     """M4：LLM Judge 二次审核 create_draft 的产物。
 
     - pass=True  → 正常结束（persist 节点留到 M4 后续阶段）
-    - pass=False → 按 failed_node 局部重跑（retry_count + 1，最多 2 次），
+    - pass=False → 按 failed_node 局部重跑（实际重跑时由 create_draft 递增 retry_count，最多 2 次），
                   复核意见写入 judge_feedback 供下一轮 create_draft 读取
     - retry_count 达上限 → handoff，error.code=JUDGE_REJECTED
     - LLM 不可用（无 Key / 超时）→ 降级放行并标记 degraded=True，
@@ -863,7 +905,7 @@ def judge(state: GraphState) -> dict[str, Any]:
     return {
         "judge_result": verdict,
         "judge_feedback": reason,
-        "retry_count": retry_count + 1,
+        "retry_count": retry_count,
     }
 
 
@@ -873,6 +915,8 @@ def _route_after_judge(state: GraphState) -> str:
     verdict = state.get("judge_result") or {}
     if verdict.get("pass"):
         return END
+    if int(state.get("retry_count") or 0) >= MAX_JUDGE_RETRY:
+        return "handoff_human"
     # 局部重跑：按 Judge 指认的失败节点回跳，最多 MAX_JUDGE_RETRY 次
     return "fetch_evidence" if verdict.get("failed_node") == "fetch_evidence" else "create_draft"
 
@@ -891,6 +935,7 @@ def compile_graph():
     sg.add_node("fetch_evidence", fetch_evidence)
     sg.add_node("check_evidence", check_evidence)
     sg.add_node("create_draft", create_draft)
+    sg.add_node("polish", polish)
     sg.add_node("judge", judge)
     sg.add_node("knowledge_agent", knowledge_agent)
     sg.add_node("handoff_human", handoff_human)
@@ -901,7 +946,8 @@ def compile_graph():
     sg.add_conditional_edges("router", _route_after_router)
     sg.add_conditional_edges("fetch_evidence", _route_after_fetch)
     sg.add_edge("check_evidence", "create_draft")
-    sg.add_edge("create_draft", "judge")
+    sg.add_edge("create_draft", "polish")
+    sg.add_edge("polish", "judge")
     sg.add_conditional_edges("judge", _route_after_judge)
     sg.add_edge("knowledge_agent", END)
     sg.add_edge("handoff_human", END)

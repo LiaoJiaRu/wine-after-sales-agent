@@ -1,16 +1,23 @@
 services:
-  # 容器内跑测试：不依赖 .env（无 Key 时 Judge 走 Fail-Open 降级），
-  # 也不依赖真实 Redis（连不上时 redis_client 自动降级为进程内实现）。
   app:
     build: .
+    env_file: .env
     environment:
       - REDIS_URL=redis://redis:6379/0
-    restart: "no"
+      - TICKETS_DB_PATH=/app/data/wine_after_sales.db
+    restart: unless-stopped
     depends_on:
       redis:
         condition: service_healthy
     ports:
-      - "8000:8000"
+      - "8501:8000"
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/_stcore/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
   redis:
     image: redis:7-alpine
