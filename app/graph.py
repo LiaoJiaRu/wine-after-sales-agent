@@ -685,12 +685,18 @@ def create_draft(state: GraphState) -> dict[str, Any]:
             )
         reply_dict, knowledge = _merge_knowledge_into_reply(state, reply_dict)
         _persist_ticket(state, ticket_draft, reply_dict.get("content", ""))
+        handoff = comp.get("recommendation") == "handoff_human"
         return {
             "ticket_draft": ticket_draft.model_dump(),
             "reply_draft": reply_dict,
             "knowledge_result": knowledge,
-            "handoff": False,
-            "needs_human": False,
+            "handoff": handoff,
+            "needs_human": handoff,
+            "error": (
+                {"code": "AUTO_REFUND_REJECTED", "message": "建议转人工处理"}
+                if handoff
+                else {}
+            ),
         }
     except ToolError as exc:
         return {

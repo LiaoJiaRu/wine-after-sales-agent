@@ -42,6 +42,19 @@
       "status": "signed",
       "fragile": true,
       "has_unboxing_video": false
+    },
+    {
+      "order_id": "O-TIMEOUT",
+      "user_id": "U999",
+      "sku": "WL-MT-500",
+      "product_name": "超时测试白酒",
+      "batch_no": "B20261018-01",
+      "quantity": 1,
+      "insured": true,
+      "insured_amount": 500,
+      "order_amount": 399,
+      "signed_at": "2026-10-01T10:00:00+08:00",
+      "status": "signed"
     }
   ]
 }

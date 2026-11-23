@@ -11,6 +11,17 @@
         {"time": "2026-11-15T14:20:00+08:00", "event": "已签收"}
       ],
       "abnormal": null
+    },
+    {
+      "order_id": "O-TIMEOUT",
+      "waybill_no": "SF-TIMEOUT",
+      "carrier": "SF",
+      "status": "delivered",
+      "signed_at": "2026-10-01T10:00:00+08:00",
+      "traces": [
+        {"time": "2026-10-01T10:00:00+08:00", "event": "已签收"}
+      ],
+      "abnormal": null
     }
   ]
 }
