@@ -13,12 +13,14 @@ from datetime import datetime, timezone
 
 import pytest
 
-_APP = "d:/projects/Wine-After-Sales-Agent/wine-after-sales-agent"
+from pathlib import Path
+
+_APP = Path(__file__).resolve().parents[1]
 
 # 动态 import ui 模块 —— 它也会被其他工具间接引用，但本文件只取两个纯函数
 _SPEC = importlib.util.spec_from_file_location(
     "streamlit_app_edge",
-    f"{_APP}/ui/streamlit_app.py",
+    str(_APP / "ui" / "streamlit_app.py"),
 )
 _streamlit_app = importlib.util.module_from_spec(_SPEC)
 try:

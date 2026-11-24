@@ -1,8 +1,8 @@
 # 10 分钟答辩演示脚本
 
-- 版本：V1.0（2026-11-24）
+- 版本：V1.1（2026-11-24，新增上台时间线与清场三连，演示环境改为 Docker Compose）
 - 适用场景：M8 现场演示与答辩
-- 演示环境：本地 Streamlit + 本地/容器 Redis + Langfuse 云端 Trace
+- 演示环境：Docker Compose 双容器（app + redis）+ Langfuse 云端 Trace；本地 Streamlit 仅作应急兜底
 - 总时长：10 分钟（含开场与收尾）
 
 ## 1. 演示目标
@@ -14,17 +14,49 @@
 3. 工单只产草稿，必须经商家端人工审核，且重复提交不会产生多条待审单。
 4. 全链路可在 Langfuse 回放，异常输入不会让系统崩溃。
 
-## 2. 演示前检查（T-10 分钟）
+## 2. 上台时间线与演示前检查
+
+### 2.1 上台时间线（彩排 → 现场）
+
+原则：镜像只在彩排时构建一次；上台当天只启动、只确认、最后清场，全程不关机。命令均在 PyCharm 终端（PowerShell）执行，先进入项目目录 `cd d:\projects\Wine-After-Sales-Agent\wine-after-sales-agent`。
+
+| 阶段 | 动作 | 预期 |
+|---|---|---|
+| 彩排 ①（演示前 1~2 天） | `docker compose up -d --build` | 唯一一次构建并启动，镜像留存本地 |
+| 彩排 ② 验证 | `docker compose ps`；`docker compose exec app python -m pytest -q` | 两服务 healthy；容器内 195 passed |
+| 彩排 ③ 全链路 | 按 §4~§9 完整跑一遍两幕 + 审核 + Trace 回放，并录制备用录屏 | Langfuse 生成当天 Trace |
+| 上台当天早上 | Docker Desktop 自启并恢复容器（勾选 Start when you log in，笔记本不休眠） | `docker compose ps` 两服务 healthy，全程不关 |
+| 上台前 10 分钟 | 执行 §2.2 清场三连（所有验证之后的最后一步） | 工单库、会话、队列恢复干净 |
+| 上台时 | 不跑任何命令；展示工程规范时敲 `docker compose ps` | 零启动等待，直接开讲 |
+
+注意：清场之后不再跑 `pytest` 与试演，避免重新写入数据；`--build` 依赖网络，只出现在彩排阶段，上台当天一律 `docker compose up -d`（不带 `--build`）。
+
+### 2.2 清场三连（上台前 10 分钟）
+
+```powershell
+# PyCharm 终端（PowerShell），先进入项目目录
+cd d:\projects\Wine-After-Sales-Agent\wine-after-sales-agent
+
+# 1) 清空 SQLite 工单表（data/ 为 bind mount，宿主机清理对容器实时生效）
+python -c "import sqlite3; conn=sqlite3.connect('data/wine_after_sales.db'); conn.execute('DELETE FROM tickets'); conn.commit(); print('DB cleared')"
+
+# 2) 清空 Redis 会话（交互式终端保留 -it；写成一键脚本时去掉 -it）
+docker exec -it wine-after-sales-agent-redis-1 redis-cli FLUSHALL
+
+# 3) 转人工队列二选一：删除求干净；推荐保留，作为转人工机制真实证据
+Remove-Item data\handoff_queue.jsonl -ErrorAction SilentlyContinue
+```
+
+### 2.3 演示前检查（T-10 分钟）
 
 | 检查项 | 操作 | 预期 |
 |---|---|---|
+| 容器状态 | `docker compose ps` | app 与 redis 均 healthy |
+| 工作台 | 浏览器打开 `http://localhost:8501` | 页面可访问（容器映射 8501:8000） |
 | 环境变量 | 确认 `.env` 已填 DeepSeek 与 Langfuse 三个 Key | 无 `MISSING_API_KEY` |
-| Redis | `docker compose ps` 或本地 `redis-cli ping` | Redis 正常；未启动也可降级演示 |
-| 工作台 | `streamlit run ui/streamlit_app.py --server.port=8000` | 打开 `http://localhost:8000` |
-| 测试基线 | `pytest -q` | 195 passed（171 M1~M6 功能 + 24 M7 边界与展示层） |
 | Trace 页面 | 提前登录 Langfuse，打开 U01 Trace 备用标签页 | 页面已加载，避免现场登录 |
-| 备用录屏 | 提前录制一遍完整两幕流程并打开播放器 | 可随时切换 |
-| 数据状态 | 保留 `data/mock_*.json` 原样，不删除运行库 | 重复演示会自动 superseded，属预期 |
+| 备用录屏 | 打开彩排时录制的播放器 | 可随时切换 |
+| 数据状态 | `data/mock_*.json` 原样保留，运行库已按 §2.2 清场 | 演示从干净工单库开始 |
 
 演示前把浏览器标签固定为：工作台、Langfuse Trace、备用录屏。
 
@@ -230,6 +262,7 @@ https://jp.cloud.langfuse.com/trace/bafdc0f1f96511b84cf6b55d5f48d35f
 |---|---|---|
 | LLM 超时或限流 | 立即切备用录屏 | 录屏包含完整两幕与审核流程 |
 | Redis 未启动 | 直接继续 | 会话自动降级为进程内存储，功能可用 |
+| 容器未启动 | `docker compose up -d`（不带 `--build`） | 镜像已彩排预构建，秒级启动 |
 | Docker 异常 | 改用本地 Streamlit | 两套启动方式等价 |
 | Streamlit 崩溃 | 切 CLI 演示 | `python -m app.cli --graph --order SO20261116001 --session demo-001 "..."` |
 | Langfuse 打不开 | 展示归档 URL 与截图 | 已提前登录并缓存页面 |
@@ -252,20 +285,27 @@ https://jp.cloud.langfuse.com/trace/bafdc0f1f96511b84cf6b55d5f48d35f
 | 重复提交怎么办？ | 旧草稿置为 `superseded`，商家端只保留最新待审单 |
 | 为什么还有 11 条 Mock Trace？ | 离线评测不产生真实调用；4 条核心场景已走真实链路并归档，其余如实标注 |
 
-## 12. 一页口令卡
+## 12. 一页口令卡（PyCharm 终端，先 cd 到项目目录）
 
 ```powershell
-# 启动工作台
+# ===== 上台当天：只启动，不构建（镜像已在彩排时 --build）=====
+docker compose up -d
+docker compose ps          # app 与 redis 均 healthy；工作台 http://localhost:8501
+
+# ===== 上台前 10 分钟：清场三连（之后不再跑测试与试演）=====
+python -c "import sqlite3; conn=sqlite3.connect('data/wine_after_sales.db'); conn.execute('DELETE FROM tickets'); conn.commit(); print('DB cleared')"
+docker exec -it wine-after-sales-agent-redis-1 redis-cli FLUSHALL
+Remove-Item data\handoff_queue.jsonl -ErrorAction SilentlyContinue   # 或保留作转人工证据
+
+# ===== 彩排：唯一一次构建 + 容器内全量测试 =====
+docker compose up -d --build
+docker compose exec app python -m pytest -q    # 195 passed
+
+# ===== 兜底：Docker 异常时本地启动 / CLI 跑完整图 =====
 streamlit run ui/streamlit_app.py --server.port=8000
-
-# 兜底：CLI 跑完整图（第一幕）
 python -m app.cli --graph --order SO20261116001 --session demo-001 "我买的酒漏了，还少一瓶，另外这酒怎么保存？"
-
-# 兜底：CLI 第二轮补证
 python -m app.cli --graph --order SO20261116001 --session demo-001 "我已经上传了开箱视频、面单照片、破损部位照片和整箱称重照片"
-
-# 全量测试
-pytest -q
+pytest -q   # 仅本地兜底环境使用（清场之前）
 ```
 
 演示参数：`order_id=SO20261116001`，`session_id=demo-001`，期望赔付 `354.00` 元。

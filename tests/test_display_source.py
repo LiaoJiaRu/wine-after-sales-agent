@@ -17,11 +17,12 @@ from app.memory import sqlite_client
 # 把 Streamlit 的两个纯函数抽到可直接 import 的位置
 # （ui 模块本身也会被其他工具间接引用，但此文件不调用 st.* 组件）
 import importlib.util  # noqa: E402
+from pathlib import Path  # noqa: E402
 
-_APP_PATH = "d:/projects/Wine-After-Sales-Agent/wine-after-sales-agent"
+_APP_PATH = Path(__file__).resolve().parents[1]
 _SPEC = importlib.util.spec_from_file_location(
     "streamlit_app_under_test",
-    f"{_APP_PATH}/ui/streamlit_app.py",
+    str(_APP_PATH / "ui" / "streamlit_app.py"),
 )
 _streamlit_app = importlib.util.module_from_spec(_SPEC)
 # 允许 ui 模块在无 streamlit 运行时也能被 import

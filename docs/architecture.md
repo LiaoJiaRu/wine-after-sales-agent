@@ -132,6 +132,23 @@ stateDiagram-v2
 | `knowledge_result` | `str` | 酒知识讲解 |
 | `error` | `dict` | `code / message / retryable` |
 
+### 2.4 Judge 质检与重跑循环（报告图4-2）
+
+状态图中 `create_draft → polish → judge` 是一段无条件串行边，`judge` 之后按裁决结果分流。下图单独放大这段质检循环，展示失败回跳与重试上限：
+
+```mermaid
+flowchart LR
+    CD["create_draft<br/>组装工单与回复草稿"] --> P["polish<br/>润色表达，锁定事实/金额"]
+    P --> J{"judge<br/>LLM 结构化质检<br/>输出 pass / reason / failed_node"}
+    J -- "pass = true" --> END1["输出草稿 → END"]
+    J -- "failed_node = fetch_evidence" --> FE["fetch_evidence<br/>按 judge_feedback 重跑取证"]
+    J -- "failed_node = create_draft" --> CD
+    J -- "retry_count ≥ 2" --> HH["handoff_human<br/>转人工，保留复核意见"]
+    FE --> CD
+```
+
+约束：`retry_count` 上限为 `MAX_JUDGE_RETRY=2`，超限不再回跳，统一转人工并把 `judge_feedback` 写入最终 State。
+
 ## 3. 设计取舍：确定性编排 vs 自由 ReAct vs Plan-and-Execute
 
 ### 3.1 三种架构对比

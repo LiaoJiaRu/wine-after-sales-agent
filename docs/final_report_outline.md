@@ -230,6 +230,7 @@
 - Dockerfile 基于 `python:3.11-slim`，启动 Streamlit 8000 端口。
 - Compose 中 Redis `healthcheck` 通过后 App 才启动；映射 `8501:8000`，挂载 `./data:/app/data`。
 - 测试隔离：全局 Mock LLM、fakeredis、`TICKETS_DB_PATH` 与 `HANDOFF_QUEUE_PATH` 指向临时目录。
+- 演示复现策略：镜像仅在彩排时 `docker compose up -d --build` 并留存本地，答辩当天只 `up -d` 秒级启动（零网络依赖）；上台前以清场三连（清 `tickets` 表、Redis `FLUSHALL`、转人工队列二选一）恢复干净环境，清场后不再写入新数据，保证现场演示可复现。
 
 ### 4.10 建议图表与代码片段
 

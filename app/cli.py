@@ -5,7 +5,7 @@ import json
 import sys
 
 from app.agents.router import route
-from app.llm import flush, trace_url
+from app.llm import flush, trace_span, trace_url
 
 
 def run_graph(user_text: str, order_id: str, session_id: str = "") -> dict:
@@ -14,14 +14,22 @@ def run_graph(user_text: str, order_id: str, session_id: str = "") -> dict:
     compile_graph().invoke() 已经有节点内 try/except + 条件边 handoff，
     这里再包一层大 try/except，保证任何 LangGraph 运行时异常（包括未被节点捕获的）
     都不会让 CLI 崩溃，而是返回 {"error": ..., "needs_human": True}。
+
+    同时用根 span（名字取 session_id，缺省 cli_graph）包住整次 invoke，
+    使 router/judge/polish/fetch_evidence 各 span 嵌套为同一棵 Trace 树。
     """
     try:
         from app.graph import RECURSION_LIMIT, compile_graph
 
-        state = compile_graph().invoke(
-            {"user_text": user_text, "order_id": order_id, "session_id": session_id},
-            config={"recursion_limit": RECURSION_LIMIT},
-        )
+        with trace_span(
+            session_id or "cli_graph",
+            input={"order_id": order_id, "session_id": session_id, "text": user_text},
+            metadata={"source": "cli"},
+        ):
+            state = compile_graph().invoke(
+                {"user_text": user_text, "order_id": order_id, "session_id": session_id},
+                config={"recursion_limit": RECURSION_LIMIT},
+            )
         # LangGraph invoke 异常不抛则 state 一定存在；再补一层 needs_human 同步
         return state
     except Exception as exc:  # pragma: no cover - 真正兜底

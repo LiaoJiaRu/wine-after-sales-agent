@@ -20,7 +20,7 @@ from langgraph.graph import END, START, StateGraph
 from typing_extensions import TypedDict
 
 from app.agents.router import route as classify_intent
-from app.llm import LLMError, judge_draft, polish_reply
+from app.llm import LLMError, judge_draft, polish_reply, trace_span
 from app.memory import redis_client, sqlite_client
 from app.tools.errors import DataSourceError, NotFoundError, ToolError
 from app.tools.schemas import EvidenceStatus
@@ -334,6 +334,18 @@ def _fetch_claim(
 
 
 def fetch_evidence(state: GraphState) -> dict[str, Any]:
+    """取证节点入口：包一层工具层 span（fetch_evidence），嵌套在根 Trace 下。"""
+    with trace_span(
+        "fetch_evidence",
+        input={
+            "order_id": state.get("order_id", ""),
+            "task_count": len(state.get("task_outputs") or []),
+        },
+    ):
+        return _fetch_evidence_inner(state)
+
+
+def _fetch_evidence_inner(state: GraphState) -> dict[str, Any]:
     """按任务取证：多意图时遍历 task_outputs 逐个执行，单意图保持原串行行为。
 
     - 理赔类子任务（破损/少件/错发）：各自调用 _fetch_claim，结果写入该任务的 result，status=success；

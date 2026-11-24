@@ -13,7 +13,7 @@ if str(PROJECT_ROOT) not in sys.path:
 import streamlit as st
 
 from app.graph import compile_graph
-from app.llm import trace_url
+from app.llm import trace_span, trace_url
 from app.memory import sqlite_client
 from app.tools.errors import NotFoundError
 from app.tools.readonly import get_order, get_logistics
@@ -69,10 +69,17 @@ def invoke_graph(user_text: str, order_id: str, session_id: str) -> dict[str, An
         "evidence": evidence,
     }
     try:
-        state = get_graph().invoke(
-            payload,
-            config={"recursion_limit": 32},
-        )
+        # 根 span 包住整次 invoke，使 router/fetch/judge/polish 嵌套为同一棵 Trace 树
+        # （与 cli.py 口径一致；trace_span 在 Langfuse 未启用时 fail-open 为空操作）
+        with trace_span(
+            session_id.strip() or "ui_graph",
+            input={"order_id": order_id.strip(), "session_id": session_id.strip(), "text": user_text},
+            metadata={"source": "ui"},
+        ):
+            state = get_graph().invoke(
+                payload,
+                config={"recursion_limit": 32},
+            )
     except Exception:
         state = {
             **payload,
