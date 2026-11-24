@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sys
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -14,11 +15,30 @@ import streamlit as st
 from app.graph import compile_graph
 from app.llm import trace_url
 from app.memory import sqlite_client
+from app.tools.errors import NotFoundError
+from app.tools.readonly import get_order, get_logistics
 
 EVIDENCE_NAMES = ["开箱视频", "面单照片", "破损部位照片", "整箱称重照片", "商品照片"]
 GRAPH_RUNTIME_MESSAGE = "系统繁忙，已转人工处理"
 ROLE_CUSTOMER = "顾客端"
 ROLE_MERCHANT = "商家审核端"
+
+
+def _jsonable(obj: Any) -> Any:
+    """递归把 datetime / date 对象转成 ISO 字符串，避免 st.json 把它们 repr 成
+    原始构造形式或显示不全，影响最终 State JSON 的可读性与可再解析性。
+
+    只处理 Python 原生 datetime / date；字符串/数字/容器原样保留，便于下游再解析。
+    """
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    if isinstance(obj, date):
+        return obj.isoformat()
+    if isinstance(obj, dict):
+        return {k: _jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_jsonable(v) for v in obj]
+    return obj
 
 
 @st.cache_resource
@@ -152,27 +172,94 @@ def render_conversation(order_id: str, session_id: str) -> None:
         st.info("请先提交一次对话，再使用上传模拟补充证据。")
 
     st.subheader("最终 State JSON")
-    st.json(state if state else {})
+    st.json(_jsonable(state) if state else {})
+
+
+def _build_ticket_view(state: dict[str, Any]) -> dict[str, Any] | None:
+    """构建工单展示用的合并视图：SQLite 真实状态 + Agent 原始快照。
+
+    纯函数，方便单元测试，不依赖 Streamlit UI。
+    返回 None 表示 state 里没有 ticket_draft；返回 dict 包含以下键：
+      - source: "sqlite" 或 "fallback"（降级展示 Agent 快照）
+      - top_status / top_created_at / top_amount / top_summary  顶层显示用字段
+      - evidence_status / compensation
+      - full_view: 渲染"查看完整工单"的完整结构
+      - sqlite_row  若命中 SQLite，含该行字典（供上层断言）
+      - warning     降级时的提示文本
+    """
+    ticket = (state or {}).get("ticket_draft") or {}
+    if not ticket:
+        return None
+
+    draft_id = str(ticket.get("draft_id") or "")
+    sqlite_row = None
+    if draft_id:
+        try:
+            sqlite_row = sqlite_client.get_ticket(draft_id)
+        except Exception:
+            sqlite_row = None
+
+    evidence_status = state.get("evidence_status") or ticket.get("evidence_status") or {}
+    compensation = ticket.get("compensation") or (state.get("tool_results") or {}).get("compensation") or {}
+
+    if sqlite_row is not None:
+        summary = sqlite_row.get("summary") or ticket.get("summary") or ""
+        status = sqlite_row.get("status", "")
+        amount = sqlite_row.get("amount", 0.0)
+        created_at = sqlite_row.get("created_at", "")
+        full_view = {**sqlite_row, "agent_snapshot": ticket}
+        source = "sqlite"
+        warning = None
+    else:
+        summary = ticket.get("summary") or ""
+        status = ticket.get("status") or "draft"
+        amount = (ticket.get("compensation") or {}).get("amount", 0.0)
+        created_at = ticket.get("created_at", "")
+        full_view = ticket
+        source = "fallback"
+        warning = f"工单 {draft_id} 在库中不存在，展示 Agent 快照。" if draft_id else None
+
+    return {
+        "source": source,
+        "top_status": status,
+        "top_created_at": created_at,
+        "top_amount": float(amount or 0.0),
+        "top_summary": summary,
+        "evidence_status": evidence_status,
+        "compensation": compensation,
+        "full_view": full_view,
+        "sqlite_row": sqlite_row,
+        "warning": warning,
+    }
 
 
 def render_ticket(state: dict[str, Any]) -> None:
-    ticket = state.get("ticket_draft") or {}
-    if not ticket:
+    """工单摘要：优先从 SQLite 取"当前真实状态"（含审核结果），找不到时降级展示 Agent 快照。"""
+    view = _build_ticket_view(state)
+    if view is None:
         st.info("当前没有工单草稿。")
         return
 
     st.subheader("工单摘要")
-    st.write(ticket.get("summary") or "暂无摘要")
+    st.write(view["top_summary"] or "暂无摘要")
+    st.caption(
+        f"状态：{view['top_status']}｜"
+        f"金额：{view['top_amount']:.2f}｜"
+        f"创建：{view['top_created_at']}"
+    )
+    if view.get("warning"):
+        st.warning(view["warning"])
+
     col_evidence, col_compensation = st.columns(2)
     with col_evidence:
         st.subheader("证据状态")
-        st.json(ticket.get("evidence_status") or state.get("evidence_status") or {})
+        st.json(_jsonable(view["evidence_status"]))
     with col_compensation:
         st.subheader("赔付建议")
-        compensation = ticket.get("compensation") or (state.get("tool_results") or {}).get("compensation") or {}
-        st.json(compensation)
+        st.json(_jsonable(view["compensation"]))
+
     with st.expander("查看完整工单"):
-        st.json(ticket)
+        st.json(_jsonable(view["full_view"]))
 
 
 def render_reply_and_knowledge(state: dict[str, Any]) -> None:
@@ -212,7 +299,7 @@ def render_review_and_trace(state: dict[str, Any]) -> None:
 
 
 def render_ticket_card(ticket: dict[str, Any]) -> None:
-    """单张待审核工单卡片：工单号 / 订单号 / 金额 / 摘要 + 审核动作。"""
+    """单张待审核工单卡片：工单号 / 订单号 / 金额 / 摘要 + 审核动作 + 原始订单联查。"""
     with st.container(border=True):
         col_id, col_order, col_amount = st.columns(3)
         col_id.markdown(f"**工单号**\n\n`{ticket.get('draft_id', '')}`")
@@ -220,6 +307,10 @@ def render_ticket_card(ticket: dict[str, Any]) -> None:
         col_amount.markdown(f"**金额**\n\n{float(ticket.get('amount') or 0.0):.2f}")
         st.markdown(f"**摘要**：{ticket.get('summary', '')}")
         st.caption(f"状态：{ticket.get('status', '')}｜创建时间：{ticket.get('created_at', '')}")
+
+        order_id = str(ticket.get("order_id", ""))
+        with st.expander("🔍 关联订单原始信息"):
+            _render_original_order(order_id)
 
         draft_id = str(ticket.get("draft_id", ""))
         col_approve, col_reject = st.columns(2)
@@ -229,8 +320,55 @@ def render_ticket_card(ticket: dict[str, Any]) -> None:
             review_ticket(draft_id, "rejected")
 
 
+def _render_original_order(order_id: str) -> None:
+    """从 Mock 数据联查原始订单与物流信息，辅助商家区分“订单”与“售后工单”。"""
+    if not order_id:
+        st.info("工单打不到 order_id，无法联查原始订单信息。")
+        return
+
+    col_order, col_logistics = st.columns(2)
+    with col_order:
+        st.markdown("**📦 原始订单**")
+        try:
+            result = get_order(order_id)
+            order = result.order
+            st.json({
+                "订单号": order.order_id,
+                "商品名": order.product_name,
+                "SKU": order.sku,
+                "批次号": order.batch_no,
+                "数量": order.quantity,
+                "原始金额": f"{order.order_amount:.2f} 元",
+                "保价": f"{order.insured_amount:.2f} 元" if order.insured else "未投保价",
+                "签收时间": order.signed_at.strftime("%Y-%m-%d %H:%M:%S") if order.signed_at else "—",
+                "订单状态": order.status,
+            })
+        except NotFoundError:
+            st.warning(f"原始订单 {order_id} 在 Mock 数据中不存在。")
+        except Exception as exc:
+            st.error(f"获取原始订单失败：{exc}")
+
+    with col_logistics:
+        st.markdown("**🚚 物流信息**")
+        try:
+            result = get_logistics(order_id)
+            shipment = result.shipment
+            st.json({
+                "物流单号": shipment.waybill_no,
+                "承运方": shipment.carrier,
+                "物流状态": shipment.status,
+                "签收时间": shipment.signed_at.strftime("%Y-%m-%d %H:%M:%S") if shipment.signed_at else "未签收",
+                "异常记录": shipment.abnormal or "无",
+                "轨迹条数": len(shipment.traces),
+            })
+        except NotFoundError:
+            st.warning(f"物流记录 {order_id} 在 Mock 数据中不存在。")
+        except Exception as exc:
+            st.error(f"获取物流信息失败：{exc}")
+
+
 def review_ticket(draft_id: str, status: str) -> None:
-    """更新工单状态并给出可见提示。"""
+    """更新工单状态并强制刷新商家端列表。"""
     try:
         updated = sqlite_client.update_ticket_status(draft_id, status)
     except Exception:
@@ -241,10 +379,21 @@ def review_ticket(draft_id: str, status: str) -> None:
         return
     action = "审核通过" if status == "approved" else "打回重审"
     st.success(f"工单 {draft_id} 已{action}。")
+    st.rerun()
 
 
 def render_merchant_review() -> None:
-    """商家审核端：读取 status=draft 的工单并处理。"""
+    """商家审核端：顶部联查原始订单，待审核卡片逐张审核（每张卡也可单独联查）。"""
+    with st.expander("🔍 联查任意订单与物流信息（顶部快捷入口）", expanded=False):
+        lookup_order_id = st.text_input(
+            "order_id",
+            value=st.session_state.get("merchant_lookup_order_id", "SO20261116001"),
+            key="merchant_lookup_order_id",
+            help="输入任意订单号，查询原始订单与物流。默认 SO20261116001 为演示订单。",
+        )
+        if st.button("查询并联查", key="merchant_lookup_submit", type="secondary"):
+            _render_original_order(lookup_order_id.strip())
+
     st.subheader("待审核工单")
     try:
         tickets = sqlite_client.list_tickets(status="draft")

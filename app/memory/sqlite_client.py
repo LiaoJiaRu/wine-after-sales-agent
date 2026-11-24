@@ -108,6 +108,18 @@ def get_tickets_by_order(order_id: str) -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
+def get_ticket(draft_id: str) -> dict[str, Any] | None:
+    """按 draft_id 查单条工单；查不到返回 None（不抛异常）。"""
+    init_db()
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT draft_id, order_id, issue_type, summary, status, amount, created_at "
+            "FROM tickets WHERE draft_id = ?",
+            (str(draft_id),),
+        ).fetchone()
+    return dict(row) if row is not None else None
+
+
 def list_tickets(status: str | None = None) -> list[dict[str, Any]]:
     """按状态查工单（不传 status 返回全部），按创建时间倒序。"""
     init_db()
