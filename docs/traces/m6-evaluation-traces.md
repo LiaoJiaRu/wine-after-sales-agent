@@ -38,8 +38,8 @@ Compose 实际构建启动时，Redis 健康检查通过后 App 启动，容器�
 ```text
 Container wine-after-sales-agent-redis-1 Healthy
 Container wine-after-sales-agent-app-1 Started
-app-1 | 159 passed, 1 warning in 8.50s
+app-1 | 171 passed, 1 warning
 app-1 exited with code 0
 ```
 
-该记录证明冻结后的代码及依赖可在 Compose 环境复现；U01/U06/U09/U14 的真实 Langfuse 云端链接见上表。
+该记录证明冻结后的代码及依赖可在 Compose 环境复现（全量基线 171 passed）；U01/U06/U09/U14 的真实 Langfuse 云端链接见上表。

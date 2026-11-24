@@ -193,10 +193,27 @@ def _build_ticket_view(state: dict[str, Any]) -> dict[str, Any] | None:
 
     draft_id = str(ticket.get("draft_id") or "")
     sqlite_row = None
+    _db_error: str | None = None
+
     if draft_id:
         try:
             sqlite_row = sqlite_client.get_ticket(draft_id)
-        except Exception:
+        except Exception as exc:
+            _msg = str(exc).lower()
+            try:
+                _current_db = str(sqlite_client._db_path())
+            except Exception:
+                _current_db = "<unknown>"
+            if "unable to open database file" in _msg or "no such table" in _msg:
+                _db_error = (
+                    f"数据库访问异常：{exc}。"
+                    f"可能原因：SQLite 路径漂移（TICKETS_DB_PATH 未设置、CWD 不对）。"
+                    f"当前 _db_path() = {_current_db}"
+                )
+            elif "database is locked" in _msg:
+                _db_error = f"数据库被锁定：{exc}，请稍后再试。"
+            else:
+                _db_error = f"数据库读取异常：{exc}"
             sqlite_row = None
 
     evidence_status = state.get("evidence_status") or ticket.get("evidence_status") or {}
@@ -217,7 +234,12 @@ def _build_ticket_view(state: dict[str, Any]) -> dict[str, Any] | None:
         created_at = ticket.get("created_at", "")
         full_view = ticket
         source = "fallback"
-        warning = f"工单 {draft_id} 在库中不存在，展示 Agent 快照。" if draft_id else None
+        if _db_error is not None:
+            warning = f"{_db_error}。降级展示 Agent 快照。"
+        elif draft_id:
+            warning = f"工单 {draft_id} 在库中不存在，展示 Agent 快照。"
+        else:
+            warning = None
 
     return {
         "source": source,

@@ -30,8 +30,27 @@ CREATE INDEX IF NOT EXISTS idx_tickets_order ON tickets(order_id);
 
 
 def _db_path() -> Path:
-    raw = os.getenv("TICKETS_DB_PATH") or os.getenv("SQLITE_PATH") or "data/wine_after_sales.db"
+    """SQLite 路径解析，消除 CWD 漂移。
+
+    优先级：TICKETS_DB_PATH > SQLITE_PATH > 默认值（锚定项目根）。
+
+    - 绝对路径：原样放行（Docker / 测试 tmp_path 覆盖场景）。
+    - 相对路径：强制拼接 PROJECT_ROOT（本文件向上两级：
+      ``wine-after-sales-agent/app/memory/sqlite_client.py → wine-after-sales-agent/``），
+      彻底消除跟随 CWD 漂移的隐患。
+    """
+    PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+    raw = (
+        os.getenv("TICKETS_DB_PATH")
+        or os.getenv("SQLITE_PATH")
+        or "data/wine_after_sales.db"
+    ).strip()
+
     path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = (PROJECT_ROOT / path).resolve()
+
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
 

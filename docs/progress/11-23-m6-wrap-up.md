@@ -1,15 +1,15 @@
 # M6 阶段3：功能冻结与 Docker Compose 验证
 
-**11-23 功能已冻结。M6 评测 15 条全部通过（成功率 100%），全量 159 条测试全绿；Docker Compose 一键拉起 Redis 与 App 验证通过，核心代码正式锁定。**
+**11-23 功能已冻结。M6 评测 15 条全部通过（成功率 100%），全量 171 条测试全绿；Docker Compose 一键拉起 Redis 与 App 验证通过，核心代码正式锁定。**
 
 ## 1. 冻结基线
 
 | 项目 | 结果 |
 |---|---|
 | M6 端到端评测 | 15 passed，成功率 100% |
-| 本地全量回归 | 159 passed（原有 144 + M6 15） |
+| 本地全量回归 | 171 passed（M1~M3 100 + M4 47 + M5 9 + M6 15） |
 | M6 阶段3语法检查 | `docker compose config` 成功 |
-| 容器内全量回归 | 159 passed，App 退出码 0 |
+| 容器内全量回归 | 171 passed，App 退出码 0 |
 | 功能状态 | 核心代码正式锁定，准备 M7 交付冻结 |
 
 本阶段未修改业务代码或测试代码，仅进行 Compose 验证并补全收尾文档。
@@ -37,7 +37,7 @@ docker compose ps -a
 2. App 镜像构建成功，依赖安装层正常复用，项目代码成功复制进镜像。
 3. `wine-after-sales-agent-redis-1` 状态为 `Up ... (healthy)`。
 4. Compose 明确输出 `redis-1 Waiting` → `redis-1 Healthy` → `app-1 Started`，健康依赖生效。
-5. App 默认命令在容器内完成全量测试：`159 passed, 1 warning in 8.50s`，随后 `app-1 exited with code 0`。
+5. App 默认命令在容器内完成全量测试：`171 passed, 1 warning`，随后 `app-1 exited with code 0`。
 6. 唯一警告为既有的 LangChain `allowed_objects` 弃用提醒，不影响运行结果。
 
 验证结束后保留原有 Redis 服务，不执行 `down`，避免中断验证前已运行的本地环境；App 容器以成功状态退出。

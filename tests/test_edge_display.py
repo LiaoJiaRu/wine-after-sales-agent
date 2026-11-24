@@ -203,3 +203,108 @@ def test_created_at_none_returns_iso_string():
 
 def test_jsonable_none_roundtrip():
     assert _jsonable(None) is None
+
+
+# ---------------------------------------------------------------------------
+# 9) evidence_status 取值链：顶层 have 优先于 ticket 内 have —— 自证场景
+# ---------------------------------------------------------------------------
+
+
+def test_evidence_status_prefers_top_level_have_over_ticket_have():
+    """顶层 state.evidence_status 与 ticket 内 evidence_status **同时存在、内容不同**，
+    断言 view 用的是顶层的 have —— 这条测试自证场景，不是空转。"""
+
+    # 先让 TD-E 进 SQLite，走完整路径；不进 SQLite 时 full_view.agent_snapshot 仍有 ticket
+    sqlite_client.save_ticket(_min_draft("TD-E"))
+
+    # 构造：顶层 have 有值、ticket 内 have 为空
+    state = {
+        "ticket_draft": {
+            "draft_id": "TD-E",
+            "evidence_status": {"complete": False, "have": [], "missing": ["开箱视频"]},
+        },
+        "evidence_status": {"complete": True, "have": ["开箱视频"], "missing": []},
+    }
+
+    # 自证 1：两条确实同时存在且 have 不同 —— 否则这个测试是空转
+    assert state["evidence_status"]["have"] != state["ticket_draft"]["evidence_status"]["have"]
+
+    view = _build_ticket_view(state)
+
+    # 自证 2：view 走到 SQLite 分支（full_view 应含 agent_snapshot）
+    assert view["source"] == "sqlite"
+    assert "agent_snapshot" in view["full_view"]
+
+    # 核心断言：view 的 have 取的是顶层的，不是 ticket 的空数组
+    assert view["evidence_status"]["have"] == ["开箱视频"], (
+        "顶层 state.evidence_status.have 应优先于 ticket_draft.evidence_status.have"
+    )
+    # 进一步确认：agent_snapshot 里 ticket 内的 have 确实是空数组（自证场景有效）
+    assert view["full_view"]["agent_snapshot"]["evidence_status"]["have"] == []
+
+
+def test_evidence_status_fallback_to_ticket_when_top_level_empty():
+    """顶层 evidence_status 为空 dict（falsy）或 None 时，应 fallback 到 ticket 内的 evidence_status。"""
+
+    sqlite_client.save_ticket(_min_draft("TD-F"))
+
+    state_empty = {
+        "ticket_draft": {
+            "draft_id": "TD-F",
+            "evidence_status": {"complete": False, "have": ["开箱视频"]},
+        },
+        "evidence_status": {},
+    }
+    view_empty = _build_ticket_view(state_empty)
+    assert view_empty["evidence_status"]["have"] == ["开箱视频"], "空 dict 应 fallback 到 ticket 内"
+
+    state_none = {
+        "ticket_draft": {
+            "draft_id": "TD-F",
+            "evidence_status": {"complete": False, "have": ["面单照片"]},
+        },
+        "evidence_status": None,
+    }
+    view_none = _build_ticket_view(state_none)
+    assert view_none["evidence_status"]["have"] == ["面单照片"], "None 应 fallback 到 ticket 内"
+
+
+def test_evidence_status_known_bug_truthy_top_level_overwrites_missing_have():
+    """⚠️ 已知 Bug：_build_ticket_view 第 202 行用 `or` 整字典替换，
+    当顶层 evidence_status truthy 但缺少 have 键时，会把 ticket 里完整的 have 一起盖掉。
+
+    这条测试锁定当前行为（have 确实丢失），后续修复业务代码为"键级合并"时，
+    需要翻转断言：应改为 assert view["evidence_status"]["have"] == ...
+    修复方案：把整字典 `or` 改成键级合并 {**ticket_es, **state_es}。
+    """
+
+    sqlite_client.save_ticket(_min_draft("TD-BUG"))
+
+    state = {
+        "ticket_draft": {
+            "draft_id": "TD-BUG",
+            "evidence_status": {
+                "complete": True,
+                "have": ["开箱视频", "面单照片"],
+                "missing": [],
+            },
+        },
+        # 顶层 truthy，但故意缺 have 键 —— 这是 Agent 跑完后 State 可能出现的真实形态
+        "evidence_status": {"complete": True},
+    }
+
+    view = _build_ticket_view(state)
+
+    # 自证：ticket 内本来有完整 have
+    assert "have" in state["ticket_draft"]["evidence_status"]
+    assert state["ticket_draft"]["evidence_status"]["have"] == ["开箱视频", "面单照片"]
+
+    # 已知 Bug：顶层 truthy 整字典覆盖后，have 键丢失
+    assert "have" not in view["evidence_status"], (
+        "BUG：顶层 truthy dict 覆盖掉了 ticket 内完整的 have —— "
+        "当前 view.evidence_status 只有 {'complete': True}，证据面板不显示 have 列表"
+    )
+    assert view["evidence_status"] == {"complete": True}, "整字典覆盖确实发生了"
+    # 修复后的期望（业务变更后翻转）：
+    # expected = {**state["ticket_draft"]["evidence_status"], **state["evidence_status"]}
+    # assert view["evidence_status"] == expected

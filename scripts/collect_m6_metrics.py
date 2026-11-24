@@ -55,7 +55,7 @@ def _read_text_robust(path: Path) -> str:
 def parse_pytest_summary(log_text: str) -> tuple[int, int]:
     """从 pytest 日志解析通过/失败数量，返回 ``(passed, failed)``。
 
-    优先匹配摘要行（如 ``15 passed, 1 warning in 2.78s`` / ``3 failed, 12 passed``），
+    优先匹配摘要行（如 ``15 passed, 1 warning in 2.78s`` / ``1 failed, 14 passed``），
     兜底时逐行统计 ``PASSED`` / ``FAILED`` 标记。空文本返回 ``(0, 0)`` 且不崩溃。
     """
     passed = 0

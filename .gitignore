@@ -12,6 +12,7 @@ venv/
 
 data/*.sqlite
 data/*.db
+data/*.jsonl
 data/chroma/
 *.log
 

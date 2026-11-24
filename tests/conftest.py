@@ -1,3 +1,8 @@
+"""全局测试隔离：Mock LLM、fakeredis、临时 SQLite 与临时转人工队列。
+
+本文件的 autouse fixture 对所有测试文件生效（含 `test_edge_demo.py`），
+任何用例都不会访问真实 LLM、本机 Redis 或写入仓库 `data/`。
+"""
 import pathlib, sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 

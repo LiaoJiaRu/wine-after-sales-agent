@@ -190,8 +190,15 @@ def draft_reply(
 
 
 def _handoff_queue_path() -> Path:
-    raw = (os.getenv("HANDOFF_QUEUE_PATH") or "").strip()
-    return Path(raw) if raw else DEFAULT_HANDOFF_QUEUE
+    """转人工队列路径，与 _db_path 同样的锚定策略。"""
+    PROJECT_ROOT = Path(__file__).resolve().parents[2]  # write.py 在 app/tools/
+
+    raw = (os.getenv("HANDOFF_QUEUE_PATH") or "").strip() or "data/handoff_queue.jsonl"
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = (PROJECT_ROOT / path).resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def write_handoff_queue(order_id: str, reason: str) -> dict:

@@ -214,7 +214,7 @@ def build_markdown(urls: dict[str, str | None]) -> str:
         "```text",
         "Container wine-after-sales-agent-redis-1 Healthy",
         "Container wine-after-sales-agent-app-1 Started",
-        "app-1 | 159 passed, 1 warning in 8.50s",
+        "app-1 | 171 passed, 1 warning",
         "app-1 exited with code 0",
         "```",
         "",
